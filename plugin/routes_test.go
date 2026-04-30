@@ -32,26 +32,39 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 	}
 
 	// Seed data.
-	db.Exec(`INSERT INTO sessions VALUES ('u1:ws:room1','[]','old summary','claude','{}','u1','team-a','2024-01-01T00:00:00Z','2024-01-02T00:00:00Z')`)
-	db.Exec(`INSERT INTO sessions VALUES ('u2:ws:room2','[]','','claude','{}','u2','team-b','2024-01-01T00:00:00Z','2024-01-01T12:00:00Z')`)
-	for i := 1; i <= 6; i++ {
-		db.Exec(`INSERT INTO messages VALUES ('u1:ws:room1',?,'user',?,?)`, i*2-1, "question "+string(rune('A'-1+i)), "2024-01-01T00:00:00Z")
-		db.Exec(`INSERT INTO messages VALUES ('u1:ws:room1',?,'assistant',?,?)`, i*2, "answer "+string(rune('A'-1+i)), "2024-01-01T00:00:00Z")
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
 	}
-	db.Exec(`INSERT INTO messages VALUES ('u2:ws:room2',1,'user','hi','2024-01-01T00:00:00Z')`)
-	db.Exec(`INSERT INTO messages VALUES ('u2:ws:room2',2,'assistant','hello','2024-01-01T00:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('u1:ws:room1','[]','old summary','claude','{}','u1','team-a','2024-01-01T00:00:00Z','2024-01-02T00:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('u2:ws:room2','[]','','claude','{}','u2','team-b','2024-01-01T00:00:00Z','2024-01-01T12:00:00Z')`)
+	for i := 1; i <= 6; i++ {
+		exec(`INSERT INTO messages VALUES ('u1:ws:room1',?,'user',?,?)`, i*2-1, "question "+string(rune('A'-1+i)), "2024-01-01T00:00:00Z")
+		exec(`INSERT INTO messages VALUES ('u1:ws:room1',?,'assistant',?,?)`, i*2, "answer "+string(rune('A'-1+i)), "2024-01-01T00:00:00Z")
+	}
+	exec(`INSERT INTO messages VALUES ('u2:ws:room2',1,'user','hi','2024-01-01T00:00:00Z')`)
+	exec(`INSERT INTO messages VALUES ('u2:ws:room2',2,'assistant','hello','2024-01-01T00:00:00Z')`)
 
-	db.Exec(`INSERT INTO memories VALUES ('m1','u1','remember this','["work"]','2024-01-01T00:00:00Z')`)
-	db.Exec(`INSERT INTO memories VALUES ('m2','','general fact','["general"]','2024-01-01T00:00:00Z')`)
+	exec(`INSERT INTO memories VALUES ('m1','u1','remember this','["work"]','2024-01-01T00:00:00Z')`)
+	exec(`INSERT INTO memories VALUES ('m2','','general fact','["general"]','2024-01-01T00:00:00Z')`)
 
-	db.Exec(`INSERT INTO entities VALUES ('u1','team-a','2024-01-01T00:00:00Z','2024-01-02T00:00:00Z')`)
-	db.Exec(`INSERT INTO entities VALUES ('u2','team-b','2024-01-01T00:00:00Z','2024-01-01T12:00:00Z')`)
+	exec(`INSERT INTO entities VALUES ('u1','team-a','2024-01-01T00:00:00Z','2024-01-02T00:00:00Z')`)
+	exec(`INSERT INTO entities VALUES ('u2','team-b','2024-01-01T00:00:00Z','2024-01-01T12:00:00Z')`)
 
-	db.Exec(`INSERT INTO profile_usage VALUES ('usg1','u1','team-a','ws','u1:ws:room1','claude',100,50,2,0.01,0.005,'2024-01-01T00:00:00Z')`)
-	db.Exec(`INSERT INTO profile_usage VALUES ('usg2','u1','team-a','ws','u1:ws:room1','claude',200,100,3,0.02,0.01,'2024-01-02T00:00:00Z')`)
+	exec(`INSERT INTO profile_usage VALUES ('usg1','u1','team-a','ws','u1:ws:room1','claude',100,50,2,0.01,0.005,'2024-01-01T00:00:00Z')`)
+	exec(`INSERT INTO profile_usage VALUES ('usg2','u1','team-a','ws','u1:ws:room1','claude',200,100,3,0.02,0.01,'2024-01-02T00:00:00Z')`)
 
 	t.Cleanup(func() { _ = db.Close() })
 	return db, sqliteDialect
+}
+
+func mustUnmarshal(t *testing.T, data []byte, v any) {
+	t.Helper()
+	if err := json.Unmarshal(data, v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
 }
 
 func newTestHandler(t *testing.T) *Handler {
@@ -76,7 +89,7 @@ func TestListSessions(t *testing.T) {
 		t.Fatalf("status = %d", w.Code)
 	}
 	var items []SessionListItem
-	json.Unmarshal(w.Body.Bytes(), &items)
+	mustUnmarshal(t, w.Body.Bytes(), &items)
 	if len(items) != 2 {
 		t.Fatalf("got %d sessions, want 2", len(items))
 	}
@@ -87,7 +100,7 @@ func TestListSessions_FilterByEntity(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleListSessions(w, httptest.NewRequest("GET", "/sessions?entity=u1", nil))
 	var items []SessionListItem
-	json.Unmarshal(w.Body.Bytes(), &items)
+	mustUnmarshal(t, w.Body.Bytes(), &items)
 	if len(items) != 1 || items[0].EntityID != "u1" {
 		t.Fatalf("got %+v, want 1 session for u1", items)
 	}
@@ -103,7 +116,7 @@ func TestGetSession(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
 	var sess SessionDetail
-	json.Unmarshal(w.Body.Bytes(), &sess)
+	mustUnmarshal(t, w.Body.Bytes(), &sess)
 	if len(sess.Messages) != 12 {
 		t.Errorf("got %d messages, want 12", len(sess.Messages))
 	}
@@ -116,7 +129,7 @@ func TestSessionMessages_Last3(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleSessionMessages(w, r)
 	var msgs []Message
-	json.Unmarshal(w.Body.Bytes(), &msgs)
+	mustUnmarshal(t, w.Body.Bytes(), &msgs)
 	if len(msgs) != 6 { // 3 pairs
 		t.Fatalf("got %d messages, want 6 (3 pairs)", len(msgs))
 	}
@@ -131,7 +144,7 @@ func TestMessages_ByEntity(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleMessages(w, httptest.NewRequest("GET", "/messages?entity=u1&last=2", nil))
 	var msgs []Message
-	json.Unmarshal(w.Body.Bytes(), &msgs)
+	mustUnmarshal(t, w.Body.Bytes(), &msgs)
 	if len(msgs) != 4 { // 2 pairs
 		t.Fatalf("got %d messages, want 4 (2 pairs)", len(msgs))
 	}
@@ -147,7 +160,7 @@ func TestListMemories(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleListMemories(w, httptest.NewRequest("GET", "/memories", nil))
 	var mems []Memory
-	json.Unmarshal(w.Body.Bytes(), &mems)
+	mustUnmarshal(t, w.Body.Bytes(), &mems)
 	if len(mems) != 2 {
 		t.Fatalf("got %d memories, want 2", len(mems))
 	}
@@ -158,7 +171,7 @@ func TestListMemories_FilterByTag(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleListMemories(w, httptest.NewRequest("GET", "/memories?tag=work", nil))
 	var mems []Memory
-	json.Unmarshal(w.Body.Bytes(), &mems)
+	mustUnmarshal(t, w.Body.Bytes(), &mems)
 	if len(mems) != 1 || mems[0].ID != "m1" {
 		t.Fatalf("got %+v, want 1 memory with tag work", mems)
 	}
@@ -169,7 +182,7 @@ func TestListEntities(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleListEntities(w, httptest.NewRequest("GET", "/entities?group=team-a", nil))
 	var ents []Entity
-	json.Unmarshal(w.Body.Bytes(), &ents)
+	mustUnmarshal(t, w.Body.Bytes(), &ents)
 	if len(ents) != 1 || ents[0].ID != "u1" {
 		t.Fatalf("got %+v, want 1 entity in team-a", ents)
 	}
@@ -180,7 +193,7 @@ func TestUsageSummary(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleUsageSummary(w, httptest.NewRequest("GET", "/usage/summary?entity=u1&group_by=model_id", nil))
 	var items []UsageSummaryItem
-	json.Unmarshal(w.Body.Bytes(), &items)
+	mustUnmarshal(t, w.Body.Bytes(), &items)
 	if len(items) != 1 {
 		t.Fatalf("got %d summary items, want 1", len(items))
 	}
