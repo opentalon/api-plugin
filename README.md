@@ -1,5 +1,8 @@
 # OpenTalon API Plugin
 
+[![CI](https://github.com/opentalon/api-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/opentalon/api-plugin/actions/workflows/ci.yml)
+![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
+
 REST API plugin for querying OpenTalon's database — sessions, messages, memories, entities, and usage statistics.
 
 ## Endpoints
