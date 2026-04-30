@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/lib/pq v1.12.3
-	github.com/opentalon/opentalon v0.0.11
+	github.com/opentalon/opentalon v0.0.12
 	modernc.org/sqlite v1.46.1
 )
 
