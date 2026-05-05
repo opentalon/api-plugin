@@ -29,16 +29,17 @@ Returns the last 5 request/response pairs (10 messages) for an entity, across al
 
 ```yaml
 plugins:
-  tools:
-    api:
-      enabled: true
-      plugin: ./api-plugin
-      expose_http: true
-      config:
-        api_token: "your-secret-token"  # optional: Bearer token for HTTP auth
+  api:
+    enabled: true
+    github: "opentalon/api-plugin"
+    ref: "master"
+    expose_http: true
+    db_access: true                    # required: injects core DB credentials
+    config:
+      api_token: "your-secret-token"  # optional: Bearer token for HTTP auth
 ```
 
-The DB connection (`__db_driver`, `__db_dsn`) is auto-injected by the host from `state.db` config — no manual setup needed.
+`db_access: true` tells the host to inject `__db_driver` and `__db_dsn` from the core `state.db` config into the plugin. Without it, the plugin has no database connection.
 
 Set `OPENTALON_HTTP_PORT` via the plugin's environment to enable the HTTP server (the host reverse-proxies `/api/*` to it).
 
@@ -48,6 +49,25 @@ When `api_token` is set, all HTTP requests require:
 
 ```
 Authorization: Bearer your-secret-token
+```
+
+## Quick test
+
+```bash
+# Health check (no auth required)
+curl -s https://opentalon.example.com/api/health
+
+# List sessions (with auth)
+curl -s -H "Authorization: Bearer your-secret-token" \
+  https://opentalon.example.com/api/sessions?limit=5
+
+# Get messages for an entity
+curl -s -H "Authorization: Bearer your-secret-token" \
+  https://opentalon.example.com/api/messages?entity=user-123&last=3
+
+# Usage summary
+curl -s -H "Authorization: Bearer your-secret-token" \
+  https://opentalon.example.com/api/usage/summary?group_by=model_id
 ```
 
 ## Build
