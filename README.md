@@ -29,13 +29,13 @@ Returns the last 5 request/response pairs (10 messages) for an entity, across al
 
 ```yaml
 plugins:
-  tools:
-    api:
-      enabled: true
-      plugin: ./api-plugin
-      expose_http: true
-      config:
-        api_token: "your-secret-token"  # optional: Bearer token for HTTP auth
+  api:
+    enabled: true
+    github: "opentalon/api-plugin"
+    ref: "master"
+    expose_http: true
+    config:
+      api_token: "your-secret-token"  # optional: Bearer token for HTTP auth
 ```
 
 The DB connection (`__db_driver`, `__db_dsn`) is auto-injected by the host from `state.db` config — no manual setup needed.
