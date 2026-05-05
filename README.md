@@ -34,11 +34,12 @@ plugins:
     github: "opentalon/api-plugin"
     ref: "master"
     expose_http: true
+    db_access: true                    # required: injects core DB credentials
     config:
       api_token: "your-secret-token"  # optional: Bearer token for HTTP auth
 ```
 
-The DB connection (`__db_driver`, `__db_dsn`) is auto-injected by the host from `state.db` config — no manual setup needed.
+`db_access: true` tells the host to inject `__db_driver` and `__db_dsn` from the core `state.db` config into the plugin. Without it, the plugin has no database connection.
 
 Set `OPENTALON_HTTP_PORT` via the plugin's environment to enable the HTTP server (the host reverse-proxies `/api/*` to it).
 
