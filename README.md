@@ -50,6 +50,25 @@ When `api_token` is set, all HTTP requests require:
 Authorization: Bearer your-secret-token
 ```
 
+## Quick test
+
+```bash
+# Health check (no auth required)
+curl -s https://opentalon.example.com/api/health
+
+# List sessions (with auth)
+curl -s -H "Authorization: Bearer your-secret-token" \
+  https://opentalon.example.com/api/sessions?limit=5
+
+# Get messages for an entity
+curl -s -H "Authorization: Bearer your-secret-token" \
+  https://opentalon.example.com/api/messages?entity=user-123&last=3
+
+# Usage summary
+curl -s -H "Authorization: Bearer your-secret-token" \
+  https://opentalon.example.com/api/usage/summary?group_by=model_id
+```
+
 ## Build
 
 ```bash
