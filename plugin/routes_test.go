@@ -3,6 +3,7 @@ package plugin
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +11,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// setupTestDB builds an in-memory SQLite mirroring the opentalon schema
+// surface that api-plugin reads from: sessions, messages, session_events,
+// prompt_snapshots. DDL is intentionally minimal — only the columns and
+// indexes the api-plugin queries.
 func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:?_journal_mode=WAL")
@@ -17,44 +22,75 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 		t.Fatal(err)
 	}
 
-	// Create schema matching core migrations 001-005.
 	for _, ddl := range []string{
-		`CREATE TABLE sessions (id TEXT PRIMARY KEY, messages TEXT, summary TEXT, active_model TEXT, metadata TEXT, entity_id TEXT DEFAULT '', group_id TEXT DEFAULT '', created_at TEXT, updated_at TEXT)`,
+		`CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			summary TEXT,
+			active_model TEXT,
+			metadata TEXT,
+			entity_id TEXT DEFAULT '',
+			group_id TEXT DEFAULT '',
+			created_at TEXT,
+			updated_at TEXT
+		)`,
 		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, created_at TEXT)`,
 		`CREATE UNIQUE INDEX idx_messages_session_seq ON messages(session_id, seq)`,
-		`CREATE TABLE memories (id TEXT PRIMARY KEY, actor_id TEXT, content TEXT, tags TEXT, created_at TEXT)`,
-		`CREATE TABLE entities (id TEXT PRIMARY KEY, group_id TEXT, first_seen TEXT, last_seen TEXT)`,
-		`CREATE TABLE profile_usage (id TEXT PRIMARY KEY, entity_id TEXT, group_id TEXT, channel_id TEXT, session_id TEXT, model_id TEXT, input_tokens INTEGER, output_tokens INTEGER, tool_calls INTEGER, input_cost REAL, output_cost REAL, created_at TEXT)`,
+		`CREATE TABLE session_events (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			ts TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			parent_id TEXT,
+			duration_ms INTEGER,
+			payload TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE prompt_snapshots (
+			sha256 TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatalf("DDL: %v", err)
 		}
 	}
 
-	// Seed data.
 	exec := func(q string, args ...any) {
 		t.Helper()
 		if _, err := db.Exec(q, args...); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('u1:ws:room1','[]','old summary','claude','{}','u1','team-a','2024-01-01T00:00:00Z','2024-01-02T00:00:00Z')`)
-	exec(`INSERT INTO sessions VALUES ('u2:ws:room2','[]','','claude','{}','u2','team-b','2024-01-01T00:00:00Z','2024-01-01T12:00:00Z')`)
-	for i := 1; i <= 6; i++ {
-		exec(`INSERT INTO messages VALUES ('u1:ws:room1',?,'user',?,?)`, i*2-1, "question "+string(rune('A'-1+i)), "2024-01-01T00:00:00Z")
-		exec(`INSERT INTO messages VALUES ('u1:ws:room1',?,'assistant',?,?)`, i*2, "answer "+string(rune('A'-1+i)), "2024-01-01T00:00:00Z")
+
+	// Two sessions, two groups. Session A (older) has 2 llm_response events
+	// with priced payloads; Session B (newer) has 1 llm_response + 1
+	// tool_call_result. Time stamps are chosen so created_at DESC gives B
+	// first and the cursor test below can walk forward into A.
+	exec(`INSERT INTO sessions VALUES ('sess_a','first session','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_b','second session','gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z')`)
+
+	exec(`INSERT INTO messages VALUES ('sess_a',1,'user','hi','2024-01-01T10:00:00Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_a',2,'assistant','hello','2024-01-01T10:00:01Z')`)
+
+	// llm_response payloads — tokens + cost matching what the opentalon
+	// provider wrapper stamps via the cost-tracking PR. Two events on
+	// sess_a (different costs) to exercise SUM correctness.
+	llmPayload := func(tokIn, tokOut int, costIn, costOut float64) string {
+		return fmt.Sprintf(`{"v":1,"raw_content_excerpt":"x","tokens_in":%d,"tokens_out":%d,"cost_input":%g,"cost_output":%g,"latency_ms":100}`,
+			tokIn, tokOut, costIn, costOut)
 	}
-	exec(`INSERT INTO messages VALUES ('u2:ws:room2',1,'user','hi','2024-01-01T00:00:00Z')`)
-	exec(`INSERT INTO messages VALUES ('u2:ws:room2',2,'assistant','hello','2024-01-01T00:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_a1','sess_a',1,'2024-01-01T10:00:00Z','llm_response',NULL,100,?,'2024-01-01T10:00:00Z')`,
+		llmPayload(1000, 500, 0.0025, 0.005))
+	exec(`INSERT INTO session_events VALUES ('evt_a2','sess_a',2,'2024-01-01T10:10:00Z','llm_response',NULL,150,?,'2024-01-01T10:10:00Z')`,
+		llmPayload(2000, 1000, 0.005, 0.010))
+	exec(`INSERT INTO session_events VALUES ('evt_b1','sess_b',1,'2024-02-01T10:00:00Z','llm_response',NULL,200,?,'2024-02-01T10:00:00Z')`,
+		llmPayload(500, 250, 0.00125, 0.0025))
+	exec(`INSERT INTO session_events VALUES ('evt_b2','sess_b',2,'2024-02-01T10:00:10Z','tool_call_result','evt_b1',50,'{"v":1,"result":"ok"}','2024-02-01T10:00:10Z')`)
 
-	exec(`INSERT INTO memories VALUES ('m1','u1','remember this','["work"]','2024-01-01T00:00:00Z')`)
-	exec(`INSERT INTO memories VALUES ('m2','','general fact','["general"]','2024-01-01T00:00:00Z')`)
-
-	exec(`INSERT INTO entities VALUES ('u1','team-a','2024-01-01T00:00:00Z','2024-01-02T00:00:00Z')`)
-	exec(`INSERT INTO entities VALUES ('u2','team-b','2024-01-01T00:00:00Z','2024-01-01T12:00:00Z')`)
-
-	exec(`INSERT INTO profile_usage VALUES ('usg1','u1','team-a','ws','u1:ws:room1','claude',100,50,2,0.01,0.005,'2024-01-01T00:00:00Z')`)
-	exec(`INSERT INTO profile_usage VALUES ('usg2','u1','team-a','ws','u1:ws:room1','claude',200,100,3,0.02,0.01,'2024-01-02T00:00:00Z')`)
+	exec(`INSERT INTO prompt_snapshots VALUES ('sha_sys_1','system_prompt','You are a helpful assistant.','2024-01-01T00:00:00Z')`)
 
 	t.Cleanup(func() { _ = db.Close() })
 	return db, sqliteDialect
@@ -63,7 +99,7 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 func mustUnmarshal(t *testing.T, data []byte, v any) {
 	t.Helper()
 	if err := json.Unmarshal(data, v); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+		t.Fatalf("unmarshal: %v\nbody: %s", err, string(data))
 	}
 }
 
@@ -72,133 +108,321 @@ func newTestHandler(t *testing.T) *Handler {
 	return &Handler{db: db, dialect: dialect}
 }
 
+func do(t *testing.T, h *Handler, target string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	h.routes().ServeHTTP(w, httptest.NewRequest("GET", target, nil))
+	return w
+}
+
 func TestHealth(t *testing.T) {
-	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleHealth(w, httptest.NewRequest("GET", "/health", nil))
-	if w.Code != 200 {
-		t.Fatalf("status = %d", w.Code)
-	}
-}
-
-func TestListSessions(t *testing.T) {
-	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleListSessions(w, httptest.NewRequest("GET", "/sessions", nil))
-	if w.Code != 200 {
-		t.Fatalf("status = %d", w.Code)
-	}
-	var items []SessionListItem
-	mustUnmarshal(t, w.Body.Bytes(), &items)
-	if len(items) != 2 {
-		t.Fatalf("got %d sessions, want 2", len(items))
-	}
-}
-
-func TestListSessions_FilterByEntity(t *testing.T) {
-	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleListSessions(w, httptest.NewRequest("GET", "/sessions?entity=u1", nil))
-	var items []SessionListItem
-	mustUnmarshal(t, w.Body.Bytes(), &items)
-	if len(items) != 1 || items[0].EntityID != "u1" {
-		t.Fatalf("got %+v, want 1 session for u1", items)
-	}
-}
-
-func TestGetSession(t *testing.T) {
-	h := newTestHandler(t)
-	r := httptest.NewRequest("GET", "/sessions/u1:ws:room1", nil)
-	r.SetPathValue("id", "u1:ws:room1")
-	w := httptest.NewRecorder()
-	h.handleGetSession(w, r)
-	if w.Code != 200 {
+	w := do(t, newTestHandler(t), "/health")
+	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
-	var sess SessionDetail
-	mustUnmarshal(t, w.Body.Bytes(), &sess)
-	if len(sess.Messages) != 12 {
-		t.Errorf("got %d messages, want 12", len(sess.Messages))
+}
+
+func TestListSessions_StatsRollupPerRow(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(resp.Items))
+	}
+	// Newest first: sess_b, then sess_a.
+	if resp.Items[0].ID != "sess_b" {
+		t.Errorf("order: items[0] = %q, want sess_b (newest first)", resp.Items[0].ID)
+	}
+	// sess_a aggregates: 2 llm_response events, sum(tokens_in) = 3000, sum(tokens_out) = 1500,
+	// sum(cost_input) = 0.0075, sum(cost_output) = 0.015.
+	a := resp.Items[1]
+	if a.Stats.LLMCallCount != 2 {
+		t.Errorf("sess_a llm_call_count = %d, want 2", a.Stats.LLMCallCount)
+	}
+	if a.Stats.TokensInTotal != 3000 {
+		t.Errorf("sess_a tokens_in_total = %d, want 3000", a.Stats.TokensInTotal)
+	}
+	if a.Stats.TokensOutTotal != 1500 {
+		t.Errorf("sess_a tokens_out_total = %d, want 1500", a.Stats.TokensOutTotal)
+	}
+	if a.Stats.CostInputTotal != 0.0075 {
+		t.Errorf("sess_a cost_input_total = %v, want 0.0075", a.Stats.CostInputTotal)
+	}
+	if a.Stats.CostOutputTotal != 0.015 {
+		t.Errorf("sess_a cost_output_total = %v, want 0.015", a.Stats.CostOutputTotal)
+	}
+	// sess_b: 1 llm_response (tool_call_result is counted separately), 1 tool_call_result.
+	b := resp.Items[0]
+	if b.Stats.LLMCallCount != 1 {
+		t.Errorf("sess_b llm_call_count = %d, want 1", b.Stats.LLMCallCount)
+	}
+	if b.Stats.ToolCallCount != 1 {
+		t.Errorf("sess_b tool_call_count = %d, want 1", b.Stats.ToolCallCount)
 	}
 }
 
-func TestSessionMessages_Last3(t *testing.T) {
+func TestListSessions_TotalsCoverFullFilteredSet(t *testing.T) {
+	// Totals must reflect every matching session, not just the current
+	// page — the review UI shows "monthly cost across N sessions" above
+	// a 25-row table.
 	h := newTestHandler(t)
-	r := httptest.NewRequest("GET", "/sessions/u1:ws:room1/messages?last=3", nil)
-	r.SetPathValue("id", "u1:ws:room1")
-	w := httptest.NewRecorder()
-	h.handleSessionMessages(w, r)
-	var msgs []Message
-	mustUnmarshal(t, w.Body.Bytes(), &msgs)
-	if len(msgs) != 6 { // 3 pairs
-		t.Fatalf("got %d messages, want 6 (3 pairs)", len(msgs))
+	w := do(t, h, "/sessions?limit=1")
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 {
+		t.Fatalf("got %d items, want 1 (paginated)", len(resp.Items))
 	}
-	// Should be oldest first after reversal.
-	if msgs[0].Role != "user" {
-		t.Errorf("first message role = %q, want user", msgs[0].Role)
+	if resp.Totals.SessionCount != 2 {
+		t.Errorf("Totals.SessionCount = %d, want 2 (across full filtered set)", resp.Totals.SessionCount)
+	}
+	// Totals: 3 llm_response events across both sessions.
+	if resp.Totals.LLMCallCount != 3 {
+		t.Errorf("Totals.LLMCallCount = %d, want 3", resp.Totals.LLMCallCount)
+	}
+	wantTokensIn := int64(3000 + 500)
+	if resp.Totals.TokensInTotal != wantTokensIn {
+		t.Errorf("Totals.TokensInTotal = %d, want %d", resp.Totals.TokensInTotal, wantTokensIn)
 	}
 }
 
-func TestMessages_ByEntity(t *testing.T) {
-	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleMessages(w, httptest.NewRequest("GET", "/messages?entity=u1&last=2", nil))
-	var msgs []Message
-	mustUnmarshal(t, w.Body.Bytes(), &msgs)
-	if len(msgs) != 4 { // 2 pairs
-		t.Fatalf("got %d messages, want 4 (2 pairs)", len(msgs))
+func TestListSessions_FilterByEntityAndGroup(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?entity_id=user_1&group_id=group_x")
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].ID != "sess_a" {
+		t.Fatalf("got %+v, want exactly sess_a", resp.Items)
 	}
-	for _, m := range msgs {
-		if m.SessionID != "u1:ws:room1" {
-			t.Errorf("unexpected session_id = %q", m.SessionID)
+}
+
+func TestListSessions_CursorPagination(t *testing.T) {
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if page1.NextCursor == "" {
+		t.Fatal("page 1: NextCursor must be set when more rows remain")
+	}
+	if page1.Items[0].ID != "sess_b" {
+		t.Errorf("page 1: items[0] = %q, want sess_b", page1.Items[0].ID)
+	}
+
+	w2 := do(t, h, "/sessions?limit=1&cursor="+page1.NextCursor)
+	var page2 SessionListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if page2.Items[0].ID != "sess_a" {
+		t.Errorf("page 2: items[0] = %q, want sess_a", page2.Items[0].ID)
+	}
+	if page2.NextCursor != "" {
+		t.Errorf("page 2: NextCursor = %q, want empty (last page)", page2.NextCursor)
+	}
+}
+
+// TestListSessions_EmptyFilterMatch is the zero-row contract: filter
+// that matches nothing returns Items=[] and Totals zeroed out. The
+// upstream guarantees this via COALESCE(..., 0) on every SUM/COUNT;
+// a regression here would surface as null fields on the API.
+func TestListSessions_EmptyFilterMatch(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?entity_id=ghost_user")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 0 {
+		t.Errorf("Items = %d, want 0 (no match)", len(resp.Items))
+	}
+	if resp.Totals.SessionCount != 0 {
+		t.Errorf("Totals.SessionCount = %d, want 0", resp.Totals.SessionCount)
+	}
+	if resp.Totals.TokensInTotal != 0 || resp.Totals.CostInputTotal != 0 {
+		t.Errorf("Totals not zeroed: %+v", resp.Totals)
+	}
+	if resp.NextCursor != "" {
+		t.Errorf("NextCursor = %q, want empty for empty page", resp.NextCursor)
+	}
+}
+
+func TestListSessions_BadCursor(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?cursor=not-base64")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestListSessions_BadTimestamp(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?since=yesterday")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestGetSession_FullDetail(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+	if len(s.Messages) != 2 {
+		t.Errorf("got %d messages, want 2", len(s.Messages))
+	}
+	if len(s.Events) != 2 {
+		t.Errorf("got %d events, want 2", len(s.Events))
+	}
+	if s.Stats.LLMCallCount != 2 {
+		t.Errorf("Stats.LLMCallCount = %d, want 2", s.Stats.LLMCallCount)
+	}
+	// Payload is inlined as raw JSON, not double-escaped.
+	if len(s.Events[0].Payload) == 0 || s.Events[0].Payload[0] != '{' {
+		t.Errorf("first event payload not raw JSON: %s", string(s.Events[0].Payload))
+	}
+}
+
+func TestGetSession_NotFound(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/does_not_exist")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestListEvents_FilterByType(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events?event_type=tool_call_result")
+	var resp EventListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].EventType != "tool_call_result" {
+		t.Fatalf("got %+v, want one tool_call_result event", resp.Items)
+	}
+}
+
+func TestListEvents_FilterByEntityRequiresJoin(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events?entity_id=user_1")
+	var resp EventListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 2 {
+		t.Fatalf("got %d events, want 2 (both belong to user_1's sess_a)", len(resp.Items))
+	}
+	for _, e := range resp.Items {
+		if e.SessionID != "sess_a" {
+			t.Errorf("event %s session = %q, want sess_a (entity filter must scope correctly)", e.ID, e.SessionID)
 		}
 	}
 }
 
-func TestListMemories(t *testing.T) {
+// TestListEvents_CursorPagination mirrors the /sessions cursor walk for
+// /events — same limit+1 probe, same composite (ts, id) cursor — so a
+// regression in either site has its own test guard.
+func TestListEvents_CursorPagination(t *testing.T) {
 	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleListMemories(w, httptest.NewRequest("GET", "/memories", nil))
-	var mems []Memory
-	mustUnmarshal(t, w.Body.Bytes(), &mems)
-	if len(mems) != 2 {
-		t.Fatalf("got %d memories, want 2", len(mems))
+	w := do(t, h, "/events?limit=2")
+	var page1 EventListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if len(page1.Items) != 2 {
+		t.Fatalf("page 1: got %d items, want 2", len(page1.Items))
+	}
+	if page1.NextCursor == "" {
+		t.Fatal("page 1: NextCursor must be set (4 events total, page size 2)")
+	}
+
+	w2 := do(t, h, "/events?limit=2&cursor="+page1.NextCursor)
+	var page2 EventListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if len(page2.Items) != 2 {
+		t.Fatalf("page 2: got %d items, want 2", len(page2.Items))
+	}
+	if page2.NextCursor != "" {
+		t.Errorf("page 2: NextCursor = %q, want empty (last page)", page2.NextCursor)
+	}
+	// Pages must not overlap: union of IDs across both pages must equal all
+	// 4 seeded events with no duplicates.
+	seen := make(map[string]struct{}, 4)
+	for _, e := range page1.Items {
+		seen[e.ID] = struct{}{}
+	}
+	for _, e := range page2.Items {
+		if _, dup := seen[e.ID]; dup {
+			t.Errorf("event %q appeared on both pages — cursor strictly-less semantics broken", e.ID)
+		}
+		seen[e.ID] = struct{}{}
+	}
+	if len(seen) != 4 {
+		t.Errorf("walked %d distinct events across pages, want 4", len(seen))
 	}
 }
 
-func TestListMemories_FilterByTag(t *testing.T) {
-	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleListMemories(w, httptest.NewRequest("GET", "/memories?tag=work", nil))
-	var mems []Memory
-	mustUnmarshal(t, w.Body.Bytes(), &mems)
-	if len(mems) != 1 || mems[0].ID != "m1" {
-		t.Fatalf("got %+v, want 1 memory with tag work", mems)
+func TestListEvents_PayloadOmittedWhenRequested(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events?include_payload=false")
+	var resp EventListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	for _, e := range resp.Items {
+		if len(e.Payload) > 0 {
+			t.Errorf("event %s carried payload despite include_payload=false: %s", e.ID, string(e.Payload))
+		}
 	}
 }
 
-func TestListEntities(t *testing.T) {
-	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleListEntities(w, httptest.NewRequest("GET", "/entities?group=team-a", nil))
-	var ents []Entity
-	mustUnmarshal(t, w.Body.Bytes(), &ents)
-	if len(ents) != 1 || ents[0].ID != "u1" {
-		t.Fatalf("got %+v, want 1 entity in team-a", ents)
+func TestEventsStats_CrossSessionTotals(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if stats.SessionCount != 2 {
+		t.Errorf("SessionCount = %d, want 2", stats.SessionCount)
+	}
+	if stats.EventCount != 4 {
+		t.Errorf("EventCount = %d, want 4", stats.EventCount)
+	}
+	if stats.LLMCallCount != 3 {
+		t.Errorf("LLMCallCount = %d, want 3", stats.LLMCallCount)
+	}
+	if stats.ToolCallCount != 1 {
+		t.Errorf("ToolCallCount = %d, want 1", stats.ToolCallCount)
+	}
+	// 1000 + 2000 + 500 = 3500 tokens_in across the three llm_response payloads.
+	if stats.TokensInTotal != 3500 {
+		t.Errorf("TokensInTotal = %d, want 3500", stats.TokensInTotal)
 	}
 }
 
-func TestUsageSummary(t *testing.T) {
-	h := newTestHandler(t)
-	w := httptest.NewRecorder()
-	h.handleUsageSummary(w, httptest.NewRequest("GET", "/usage/summary?entity=u1&group_by=model_id", nil))
-	var items []UsageSummaryItem
-	mustUnmarshal(t, w.Body.Bytes(), &items)
-	if len(items) != 1 {
-		t.Fatalf("got %d summary items, want 1", len(items))
+func TestEventsStats_FilteredByGroup(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats?group_id=group_x")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if stats.SessionCount != 1 {
+		t.Errorf("SessionCount = %d, want 1 (only group_x)", stats.SessionCount)
 	}
-	if items[0].TotalInput != 300 || items[0].TotalOutput != 150 {
-		t.Errorf("totals = %d/%d, want 300/150", items[0].TotalInput, items[0].TotalOutput)
+	if stats.LLMCallCount != 2 {
+		t.Errorf("LLMCallCount = %d, want 2 (only sess_a)", stats.LLMCallCount)
+	}
+}
+
+func TestPromptSnapshot_Get(t *testing.T) {
+	w := do(t, newTestHandler(t), "/prompt-snapshots?sha=sha_sys_1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var p PromptSnapshot
+	mustUnmarshal(t, w.Body.Bytes(), &p)
+	if p.Content != "You are a helpful assistant." {
+		t.Errorf("Content = %q", p.Content)
+	}
+}
+
+func TestPromptSnapshot_MissingShaParam(t *testing.T) {
+	w := do(t, newTestHandler(t), "/prompt-snapshots")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestPromptSnapshot_NotFound(t *testing.T) {
+	w := do(t, newTestHandler(t), "/prompt-snapshots?sha=nope")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
 	}
 }
 
@@ -207,17 +431,14 @@ func TestAuthMiddleware(t *testing.T) {
 		w.WriteHeader(200)
 	})
 
-	// With token required.
 	h := authMiddleware("secret", inner)
 
-	// No token → 401.
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
 	if w.Code != 401 {
 		t.Errorf("no token: status = %d, want 401", w.Code)
 	}
 
-	// Wrong token → 401.
 	w = httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/", nil)
 	r.Header.Set("Authorization", "Bearer wrong")
@@ -226,7 +447,6 @@ func TestAuthMiddleware(t *testing.T) {
 		t.Errorf("wrong token: status = %d, want 401", w.Code)
 	}
 
-	// Correct token → 200.
 	w = httptest.NewRecorder()
 	r = httptest.NewRequest("GET", "/", nil)
 	r.Header.Set("Authorization", "Bearer secret")
@@ -235,7 +455,6 @@ func TestAuthMiddleware(t *testing.T) {
 		t.Errorf("correct token: status = %d, want 200", w.Code)
 	}
 
-	// No token configured → pass through.
 	h2 := authMiddleware("", inner)
 	w = httptest.NewRecorder()
 	h2.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))

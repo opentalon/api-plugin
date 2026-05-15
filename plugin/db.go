@@ -43,6 +43,32 @@ func (d Dialect) TagMatch(column string) string {
 	return fmt.Sprintf("EXISTS (SELECT 1 FROM json_each(%s) WHERE json_each.value = ?)", column)
 }
 
+// JSONInt returns dialect-specific SQL that extracts a top-level integer
+// field from a JSON-encoded TEXT column. Used by JIT aggregation queries
+// over session_events.payload — opentalon stores payload as TEXT for
+// schema portability (see migration 009_session_events.sql), so analytics
+// joins extract on the read path here.
+//
+// fieldName MUST be a hard-coded constant (event_types.go field names)
+// — never user input — because it's interpolated rather than bound. The
+// helpers in this file follow that contract.
+func (d Dialect) JSONInt(column, fieldName string) string {
+	if d.name == "postgres" {
+		return fmt.Sprintf(`COALESCE(NULLIF(%s::jsonb->>'%s','')::bigint, 0)`, column, fieldName)
+	}
+	return fmt.Sprintf(`COALESCE(CAST(json_extract(%s,'$.%s') AS INTEGER), 0)`, column, fieldName)
+}
+
+// JSONFloat is the float64 counterpart of JSONInt — for cost_input /
+// cost_output stamped on llm_response payloads. Same fieldName-as-constant
+// contract applies.
+func (d Dialect) JSONFloat(column, fieldName string) string {
+	if d.name == "postgres" {
+		return fmt.Sprintf(`COALESCE(NULLIF(%s::jsonb->>'%s','')::double precision, 0)`, column, fieldName)
+	}
+	return fmt.Sprintf(`COALESCE(CAST(json_extract(%s,'$.%s') AS REAL), 0)`, column, fieldName)
+}
+
 // OpenDB opens a read-only database connection.
 func OpenDB(driver, dsn string) (*sql.DB, Dialect, error) {
 	switch driver {
