@@ -153,15 +153,37 @@ type EventListResponse struct {
 
 // EventStats is GET /events/stats — cross-session aggregates that mirror
 // SessionTotals plus the session count, scoped by the same filters.
+//
+// ByEventType is populated only when ?group_by=event_type is set AND the
+// filtered window contains events. Each bucket's SampleSessionIDs is
+// populated only when ?sample_sessions=N (1..5) is also set. The
+// omit-when-empty shape keeps the default response identical to the
+// pre-group_by contract — and, by the same JSON semantics, drops
+// by_event_type from the response when group_by was requested over an
+// empty window (the consumer knows from their own request).
 type EventStats struct {
-	SessionCount    int     `json:"session_count"`
-	EventCount      int64   `json:"event_count"`
-	LLMCallCount    int64   `json:"llm_call_count"`
-	ToolCallCount   int64   `json:"tool_call_count"`
-	TokensInTotal   int64   `json:"tokens_in_total"`
-	TokensOutTotal  int64   `json:"tokens_out_total"`
-	CostInputTotal  float64 `json:"cost_input_total"`
-	CostOutputTotal float64 `json:"cost_output_total"`
+	SessionCount    int               `json:"session_count"`
+	EventCount      int64             `json:"event_count"`
+	LLMCallCount    int64             `json:"llm_call_count"`
+	ToolCallCount   int64             `json:"tool_call_count"`
+	TokensInTotal   int64             `json:"tokens_in_total"`
+	TokensOutTotal  int64             `json:"tokens_out_total"`
+	CostInputTotal  float64           `json:"cost_input_total"`
+	CostOutputTotal float64           `json:"cost_output_total"`
+	ByEventType     []EventTypeBucket `json:"by_event_type,omitempty"`
+}
+
+// EventTypeBucket is one row of the by_event_type breakdown. SampleSessionIDs
+// is omitted from the JSON unless ?sample_sessions=N is set AND at least one
+// session matches the bucket — same omit-when-empty semantics as
+// EventStats.ByEventType, so the two fields stay symmetric. Ordering of
+// buckets in EventStats.ByEventType is (count DESC, event_type ASC) —
+// deterministic so the consumer can concatenate / diff result sets across
+// windows.
+type EventTypeBucket struct {
+	EventType        string   `json:"event_type"`
+	Count            int64    `json:"count"`
+	SampleSessionIDs []string `json:"sample_session_ids,omitempty"`
 }
 
 // PromptSnapshot is GET /prompt-snapshots?sha=... — the read side of the
@@ -183,6 +205,13 @@ const (
 	defaultLimit = 25
 	maxLimit     = 200
 )
+
+// maxSampleSessions caps ?sample_sessions=N on /events/stats. 5 covers
+// the "give me a couple of examples to seed a drill-down" use case while
+// bounding the per-bucket secondary query and the response size — at
+// the documented ~24-event-type ceiling and 5 IDs per bucket the upper
+// bound is 120 small ID strings.
+const maxSampleSessions = 5
 
 // Event-type constants mirror events.Type* in opentalon. Keeping the
 // strings local (rather than importing the opentalon Go package just to
@@ -397,17 +426,50 @@ func (h *Handler) handleListEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleEventsStats(w http.ResponseWriter, r *http.Request) {
-	f, err := filtersFromQuery(r)
+	opts, err := eventsStatsOptsFromQuery(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stats, err := eventsStats(h.db, h.dialect, f)
+	stats, err := eventsStats(h.db, h.dialect, opts)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, stats)
+}
+
+// eventsStatsOptsFromQuery parses the /events/stats query string into the
+// opts struct. Mirrors filtersFromQuery — keeps the handler narrow and
+// puts all validation in one place where a future param can be added
+// without touching the handler.
+func eventsStatsOptsFromQuery(r *http.Request) (eventsStatsOpts, error) {
+	f, err := filtersFromQuery(r)
+	if err != nil {
+		return eventsStatsOpts{}, err
+	}
+	opts := eventsStatsOpts{Filters: f}
+	q := r.URL.Query()
+	if gb := q.Get("group_by"); gb != "" {
+		if gb != "event_type" {
+			return eventsStatsOpts{}, fmt.Errorf("group_by: only 'event_type' is supported")
+		}
+		opts.GroupByEventType = true
+	}
+	if ss := q.Get("sample_sessions"); ss != "" {
+		// sample_sessions is meaningless without a grouping dimension —
+		// reject explicitly so the consumer notices the mis-call instead
+		// of silently getting unsampled buckets back.
+		if !opts.GroupByEventType {
+			return eventsStatsOpts{}, fmt.Errorf("sample_sessions requires group_by=event_type")
+		}
+		n, err := strconv.Atoi(ss)
+		if err != nil || n < 1 || n > maxSampleSessions {
+			return eventsStatsOpts{}, fmt.Errorf("sample_sessions: must be an integer in 1..%d", maxSampleSessions)
+		}
+		opts.SampleSessions = n
+	}
+	return opts, nil
 }
 
 func (h *Handler) handlePromptSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -745,11 +807,53 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 	return items, next, nil
 }
 
-func eventsStats(db *sql.DB, d Dialect, f sessionFilters) (EventStats, error) {
-	// /events/stats is the cross-session aggregate; same JIT pattern as
-	// sessionTotals but without the per-session GROUP BY. Always JOINs
-	// sessions so entity/group filters work — when neither is set the
-	// JOIN is still cheap (PK side).
+// eventsStatsOpts captures the optional shaping params on /events/stats.
+// The default zero-value behaves identically to the pre-group_by contract:
+// just the top-level aggregates, no buckets.
+type eventsStatsOpts struct {
+	Filters          sessionFilters
+	GroupByEventType bool
+	SampleSessions   int // 0 = omit sample_session_ids; 1..maxSampleSessions otherwise
+}
+
+// eventsStats is the orchestrator: top-level totals always, plus an
+// optional per-event_type breakdown, plus optional per-bucket session
+// samples. Each piece is its own SQL — counts and samples could be
+// fused with array_agg in Postgres but SQLite's lack of bounded array
+// aggregation pushes us to the portable two-query path. Each query is
+// over the same indexed JOIN, so the round-trip cost stays modest.
+func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error) {
+	stats, err := eventsStatsTotals(db, d, opts.Filters)
+	if err != nil {
+		return EventStats{}, err
+	}
+	if !opts.GroupByEventType {
+		return stats, nil
+	}
+	buckets, err := eventsStatsByEventType(db, d, opts.Filters)
+	if err != nil {
+		return EventStats{}, err
+	}
+	if opts.SampleSessions > 0 {
+		if err := fillSampleSessionIDs(db, d, opts.Filters, buckets, opts.SampleSessions); err != nil {
+			return EventStats{}, err
+		}
+	}
+	// Note: when group_by is set but the filtered window has no events,
+	// buckets is nil and `omitempty` drops the field — the response then
+	// looks identical to an un-grouped call. That's fine: the consumer
+	// authored the request and already knows they asked for grouping; a
+	// "present-but-empty" contract would require pointer-to-slice for one
+	// edge case and isn't worth the API ergonomics cost.
+	stats.ByEventType = buckets
+	return stats, nil
+}
+
+func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, error) {
+	// Cross-session aggregate; same JIT pattern as sessionTotals but
+	// without the per-session GROUP BY. Always JOINs sessions so
+	// entity/group filters work — when neither is set the JOIN is still
+	// cheap (PK side).
 	var q strings.Builder
 	q.WriteString(`SELECT
 		COUNT(DISTINCT s.id) AS session_count,
@@ -771,9 +875,86 @@ func eventsStats(db *sql.DB, d Dialect, f sessionFilters) (EventStats, error) {
 		&stats.LLMCallCount, &stats.ToolCallCount,
 		&stats.TokensInTotal, &stats.TokensOutTotal,
 		&stats.CostInputTotal, &stats.CostOutputTotal); err != nil {
-		return EventStats{}, fmt.Errorf("eventsStats: %w", err)
+		return EventStats{}, fmt.Errorf("eventsStatsTotals: %w", err)
 	}
 	return stats, nil
+}
+
+// eventsStatsByEventType returns one row per distinct event_type in the
+// filtered window. INNER JOIN (not LEFT JOIN like the totals query) —
+// sessions with zero events don't contribute to any bucket by design.
+// Ordering is deterministic (count DESC, event_type ASC) so consumers
+// can diff/concatenate across windows.
+func eventsStatsByEventType(db *sql.DB, d Dialect, f sessionFilters) ([]EventTypeBucket, error) {
+	var q strings.Builder
+	q.WriteString(`SELECT se.event_type, COUNT(*) AS c
+		FROM sessions s JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
+	var args []any
+	applySessionFilters(&q, &args, f)
+	q.WriteString(` GROUP BY se.event_type ORDER BY c DESC, se.event_type ASC`)
+
+	rows, err := db.Query(d.Rebind(q.String()), args...)
+	if err != nil {
+		return nil, fmt.Errorf("eventsStatsByEventType: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var buckets []EventTypeBucket
+	for rows.Next() {
+		var b EventTypeBucket
+		if err := rows.Scan(&b.EventType, &b.Count); err != nil {
+			return nil, fmt.Errorf("eventsStatsByEventType scan: %w", err)
+		}
+		buckets = append(buckets, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("eventsStatsByEventType rows: %w", err)
+	}
+	return buckets, nil
+}
+
+// fillSampleSessionIDs populates SampleSessionIDs on each bucket with the
+// most-recent N distinct session IDs that contain at least one event of
+// that type in the filtered window.
+//
+// One query per bucket (rather than a single window-function query). The
+// bucket count is bounded by the number of distinct event types in the
+// filtered window (~24 at the documented top end) and each query is a
+// small index scan on (event_type, ts), so the worst case is ~24 cheap
+// lookups in exchange for a portable cross-dialect implementation that
+// avoids array_agg/string_agg dialect drift.
+func fillSampleSessionIDs(db *sql.DB, d Dialect, f sessionFilters, buckets []EventTypeBucket, n int) error {
+	for i := range buckets {
+		var q strings.Builder
+		// Inner GROUP BY collapses to one row per (event_type, session_id)
+		// pair with the most-recent ts in that pair; the outer ORDER BY
+		// then ranks sessions by recency within the bucket.
+		q.WriteString(`SELECT session_id FROM (
+			SELECT se.session_id, MAX(se.ts) AS last_ts
+			FROM sessions s JOIN session_events se ON se.session_id = s.id
+			WHERE se.event_type = ?`)
+		args := []any{buckets[i].EventType}
+		applySessionFilters(&q, &args, f)
+		q.WriteString(` GROUP BY se.session_id) sub ORDER BY last_ts DESC, session_id LIMIT ?`)
+		args = append(args, n)
+
+		rows, err := db.Query(d.Rebind(q.String()), args...)
+		if err != nil {
+			return fmt.Errorf("fillSampleSessionIDs[%s]: %w", buckets[i].EventType, err)
+		}
+		for rows.Next() {
+			var sid string
+			if err := rows.Scan(&sid); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("fillSampleSessionIDs scan: %w", err)
+			}
+			buckets[i].SampleSessionIDs = append(buckets[i].SampleSessionIDs, sid)
+		}
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("fillSampleSessionIDs rows: %w", err)
+		}
+	}
+	return nil
 }
 
 func getPromptSnapshot(db *sql.DB, d Dialect, sha string) (*PromptSnapshot, error) {

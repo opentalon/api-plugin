@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -397,6 +398,273 @@ func TestEventsStats_FilteredByGroup(t *testing.T) {
 	}
 	if stats.LLMCallCount != 2 {
 		t.Errorf("LLMCallCount = %d, want 2 (only sess_a)", stats.LLMCallCount)
+	}
+}
+
+// TestEventsStats_DefaultShapeUnchanged guards the backwards-compatibility
+// promise of the group_by extension: omitting the new params yields the
+// exact same response shape as before the change. by_event_type is
+// absent from the JSON, not present-but-empty.
+func TestEventsStats_DefaultShapeUnchanged(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "by_event_type") {
+		t.Errorf("default response leaked by_event_type key: %s", w.Body.String())
+	}
+}
+
+func TestEventsStats_GroupByEventType_CountsAndOrdering(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats?group_by=event_type")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.ByEventType) != 2 {
+		t.Fatalf("ByEventType len = %d, want 2 (llm_response + tool_call_result)", len(stats.ByEventType))
+	}
+	// count DESC, so llm_response (3) before tool_call_result (1).
+	if stats.ByEventType[0].EventType != "llm_response" || stats.ByEventType[0].Count != 3 {
+		t.Errorf("bucket[0] = %+v, want {llm_response, 3}", stats.ByEventType[0])
+	}
+	if stats.ByEventType[1].EventType != "tool_call_result" || stats.ByEventType[1].Count != 1 {
+		t.Errorf("bucket[1] = %+v, want {tool_call_result, 1}", stats.ByEventType[1])
+	}
+	// Bucket sum must match top-level event_count — same JIT JOIN
+	// underneath, so any drift means the filter set diverged.
+	var bucketSum int64
+	for _, b := range stats.ByEventType {
+		bucketSum += b.Count
+	}
+	if bucketSum != stats.EventCount {
+		t.Errorf("sum(bucket counts) = %d, want event_count = %d", bucketSum, stats.EventCount)
+	}
+	// Without sample_sessions, no sample_session_ids on any bucket.
+	for _, b := range stats.ByEventType {
+		if b.SampleSessionIDs != nil {
+			t.Errorf("bucket %q leaked sample_session_ids without ?sample_sessions: %v",
+				b.EventType, b.SampleSessionIDs)
+		}
+	}
+}
+
+// TestEventsStats_GroupBy_TiebreakerEventTypeAsc adds two extra event
+// types with equal counts so the (event_type ASC) tiebreaker — not just
+// the (count DESC) primary sort — is exercised.
+func TestEventsStats_GroupBy_TiebreakerEventTypeAsc(t *testing.T) {
+	h := newTestHandler(t)
+	// Two more event types, each with one event — same count, distinct
+	// types. event_type ASC means "retry" sorts before "zzz_aux".
+	if _, err := h.db.Exec(
+		`INSERT INTO session_events VALUES ('evt_extra1','sess_a',3,'2024-01-01T11:00:00Z','retry',NULL,10,'{}','2024-01-01T11:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(
+		`INSERT INTO session_events VALUES ('evt_extra2','sess_b',3,'2024-02-01T11:00:00Z','zzz_aux',NULL,10,'{}','2024-02-01T11:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	w := do(t, h, "/events/stats?group_by=event_type")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.ByEventType) != 4 {
+		t.Fatalf("ByEventType len = %d, want 4; got %+v", len(stats.ByEventType), stats.ByEventType)
+	}
+	// llm_response (3), tool_call_result (1), retry (1), zzz_aux (1).
+	// Among the count-1 bucket: retry < tool_call_result < zzz_aux.
+	want := []struct {
+		t string
+		c int64
+	}{
+		{"llm_response", 3},
+		{"retry", 1},
+		{"tool_call_result", 1},
+		{"zzz_aux", 1},
+	}
+	for i, w := range want {
+		if stats.ByEventType[i].EventType != w.t || stats.ByEventType[i].Count != w.c {
+			t.Errorf("bucket[%d] = %+v, want {%s, %d}",
+				i, stats.ByEventType[i], w.t, w.c)
+		}
+	}
+}
+
+func TestEventsStats_GroupBy_WithSampleSessions(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats?group_by=event_type&sample_sessions=5")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.ByEventType) != 2 {
+		t.Fatalf("ByEventType len = %d, want 2", len(stats.ByEventType))
+	}
+	// llm_response: both sessions touch it. Most-recent first means
+	// sess_b (2024-02-01) before sess_a (2024-01-01).
+	llm := stats.ByEventType[0]
+	if llm.EventType != "llm_response" {
+		t.Fatalf("bucket[0] = %q, want llm_response", llm.EventType)
+	}
+	wantSamples := []string{"sess_b", "sess_a"}
+	if len(llm.SampleSessionIDs) != len(wantSamples) {
+		t.Fatalf("llm_response sample_session_ids = %v, want %v", llm.SampleSessionIDs, wantSamples)
+	}
+	for i, want := range wantSamples {
+		if llm.SampleSessionIDs[i] != want {
+			t.Errorf("llm_response samples[%d] = %q, want %q (most-recent-first)", i, llm.SampleSessionIDs[i], want)
+		}
+	}
+	// tool_call_result: only sess_b has one.
+	tool := stats.ByEventType[1]
+	if tool.EventType != "tool_call_result" {
+		t.Fatalf("bucket[1] = %q, want tool_call_result", tool.EventType)
+	}
+	if len(tool.SampleSessionIDs) != 1 || tool.SampleSessionIDs[0] != "sess_b" {
+		t.Errorf("tool_call_result samples = %v, want [sess_b]", tool.SampleSessionIDs)
+	}
+}
+
+// TestEventsStats_GroupBy_SampleSessionsRespectsLimit verifies N caps the
+// per-bucket array — three sessions touch llm_response but N=2 yields 2.
+func TestEventsStats_GroupBy_SampleSessionsRespectsLimit(t *testing.T) {
+	h := newTestHandler(t)
+	// Add a third llm_response in a brand-new session so the bucket has
+	// three distinct sessions. Most-recent timestamp goes to sess_c so
+	// we can also confirm it lands at index 0 under N=2.
+	if _, err := h.db.Exec(
+		`INSERT INTO sessions VALUES ('sess_c','third','gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(
+		`INSERT INTO session_events VALUES ('evt_c1','sess_c',1,'2024-03-01T10:00:00Z','llm_response',NULL,100,'{"v":1,"tokens_in":1,"tokens_out":1,"cost_input":0,"cost_output":0}','2024-03-01T10:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	w := do(t, h, "/events/stats?group_by=event_type&sample_sessions=2")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	llm := stats.ByEventType[0]
+	if llm.EventType != "llm_response" {
+		t.Fatalf("bucket[0] = %q, want llm_response", llm.EventType)
+	}
+	if len(llm.SampleSessionIDs) != 2 {
+		t.Fatalf("len(SampleSessionIDs) = %d, want 2 (capped by N)", len(llm.SampleSessionIDs))
+	}
+	// Most-recent-first: sess_c (Mar), sess_b (Feb). sess_a (Jan) dropped.
+	if llm.SampleSessionIDs[0] != "sess_c" || llm.SampleSessionIDs[1] != "sess_b" {
+		t.Errorf("samples = %v, want [sess_c sess_b]", llm.SampleSessionIDs)
+	}
+}
+
+func TestEventsStats_GroupBy_FilterStillApplies(t *testing.T) {
+	// group_id=group_x → only sess_a. So buckets should reflect only
+	// sess_a's events: llm_response=2 (no tool_call_result).
+	w := do(t, newTestHandler(t), "/events/stats?group_by=event_type&group_id=group_x")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.ByEventType) != 1 {
+		t.Fatalf("ByEventType len = %d, want 1 (only llm_response under group_x)", len(stats.ByEventType))
+	}
+	if stats.ByEventType[0].EventType != "llm_response" || stats.ByEventType[0].Count != 2 {
+		t.Errorf("bucket = %+v, want {llm_response, 2}", stats.ByEventType[0])
+	}
+}
+
+// TestEventsStats_GroupBy_EmptyWindowOmitsBuckets locks in the documented
+// shape for the corner case "group_by requested over a filter that matches
+// no events": top-level aggregates are zero, by_event_type is omitted
+// (not present-but-empty). See the EventStats doc comment for the why —
+// pointer-to-slice was rejected.
+func TestEventsStats_GroupBy_EmptyWindowOmitsBuckets(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats?group_by=event_type&entity_id=does_not_exist")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "by_event_type") {
+		t.Errorf("empty-window response should omit by_event_type: %s", body)
+	}
+	var stats EventStats
+	mustUnmarshal(t, []byte(body), &stats)
+	if stats.SessionCount != 0 || stats.EventCount != 0 {
+		t.Errorf("expected zero counts for empty window, got SessionCount=%d EventCount=%d",
+			stats.SessionCount, stats.EventCount)
+	}
+}
+
+func TestEventsStats_GroupBy_InvalidValue(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats?group_by=session_id")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (group_by=session_id unsupported)", w.Code)
+	}
+}
+
+func TestEventsStats_SampleSessions_RequiresGroupBy(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats?sample_sessions=2")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (sample_sessions without group_by)", w.Code)
+	}
+}
+
+func TestEventsStats_SampleSessions_OutOfRange(t *testing.T) {
+	for _, ss := range []string{"0", "6", "100", "-1", "foo"} {
+		w := do(t, newTestHandler(t), "/events/stats?group_by=event_type&sample_sessions="+ss)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("sample_sessions=%s: status = %d, want 400", ss, w.Code)
+		}
+	}
+}
+
+// TestEventsStats_GroupBy_EmptyValueTreatedAsAbsent locks in the handler's
+// "empty == absent" contract: `?group_by=` (empty value, key present) is
+// treated identically to omitting the param. Same for `?sample_sessions=`.
+// This matches how filtersFromQuery handles entity_id="", and avoids
+// surprising the consumer when they programmatically build URLs with
+// optional defaults.
+func TestEventsStats_GroupBy_EmptyValueTreatedAsAbsent(t *testing.T) {
+	w := do(t, newTestHandler(t), "/events/stats?group_by=&sample_sessions=")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "by_event_type") {
+		t.Errorf("empty group_by= should be treated as absent: %s", w.Body.String())
+	}
+}
+
+// TestEventsStats_GroupBy_SampleSessionIDsTiebreaker exercises the
+// (last_ts DESC, session_id ASC) ordering in fillSampleSessionIDs. With
+// two sessions whose max-ts on the bucket's event type collide exactly,
+// the session_id-ASC tiebreaker should produce a deterministic result —
+// otherwise sample arrays drift across requests and dashboards flicker.
+func TestEventsStats_GroupBy_SampleSessionIDsTiebreaker(t *testing.T) {
+	h := newTestHandler(t)
+	// Two new sessions whose llm_response events share the same ts.
+	// session_id ASC means sess_alpha sorts before sess_beta.
+	const sameTS = "2024-04-01T10:00:00Z"
+	for _, sid := range []string{"sess_beta", "sess_alpha"} {
+		if _, err := h.db.Exec(
+			`INSERT INTO sessions VALUES (?,'tie','gpt-4o','{}','user_tie','group_tie',?,?)`,
+			sid, sameTS, sameTS); err != nil {
+			t.Fatal(err)
+		}
+		evtID := "evt_" + sid
+		if _, err := h.db.Exec(
+			`INSERT INTO session_events VALUES (?,?,1,?,'llm_response',NULL,1,'{"v":1,"tokens_in":1,"tokens_out":1,"cost_input":0,"cost_output":0}',?)`,
+			evtID, sid, sameTS, sameTS); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Scope to the tied group so we get a clean two-row result for samples.
+	w := do(t, h, "/events/stats?group_by=event_type&sample_sessions=5&group_id=group_tie")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.ByEventType) != 1 || stats.ByEventType[0].EventType != "llm_response" {
+		t.Fatalf("ByEventType = %+v, want one bucket (llm_response)", stats.ByEventType)
+	}
+	got := stats.ByEventType[0].SampleSessionIDs
+	want := []string{"sess_alpha", "sess_beta"}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("samples = %v, want %v (session_id ASC tiebreaker)", got, want)
 	}
 }
 
