@@ -13,7 +13,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 | GET | `/sessions` | Paginated session list, each row with its own JIT-aggregated `stats`, plus `totals` over the full filtered set |
 | GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats` |
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
-| GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions`, no per-session breakdown |
+| GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions`, optional `group_by=event_type` + `sample_sessions=N` |
 | GET | `/prompt-snapshots?sha=...` | Resolve a prompt body by sha256 (referenced from `turn_start` events) |
 
 ### Filters
@@ -64,7 +64,36 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 }
 ```
 
-`/events/stats` returns just the totals block.
+`/events/stats` returns just the totals block by default.
+
+#### Optional grouping on `/events/stats`
+
+To answer "what's going wrong in conversations" in one round-trip instead of N parallel calls, `/events/stats` accepts two optional params:
+
+- `group_by=event_type` — adds a `by_event_type` array, one bucket per distinct `event_type` in the filtered window. Buckets are ordered `count DESC, event_type ASC` (deterministic). Default response shape (without the param) is unchanged.
+- `sample_sessions=N` (1–5) — only valid combined with `group_by=event_type`; each bucket then gains `sample_session_ids`: up to N distinct session IDs that contain at least one event of that type in the window, ordered by most-recent-first per session.
+
+```jsonc
+// GET /events/stats?group_by=event_type&sample_sessions=3
+{
+  "session_count": 142,
+  "event_count": 1934,
+  "llm_call_count": 631,
+  "tool_call_count": 412,
+  "tokens_in_total": ...,
+  "tokens_out_total": ...,
+  "cost_input_total": ...,
+  "cost_output_total": ...,
+  "by_event_type": [
+    { "event_type": "llm_response",          "count": 631, "sample_session_ids": ["sess_a1","sess_b2","sess_c3"] },
+    { "event_type": "tool_call_result",      "count": 412, "sample_session_ids": ["sess_a1","sess_b2","sess_c3"] },
+    { "event_type": "retry",                 "count": 156, "sample_session_ids": ["sess_d4","sess_e5","sess_f6"] },
+    { "event_type": "tool_call_not_found",   "count":  89, "sample_session_ids": ["sess_g7","sess_h8","sess_i9"] }
+  ]
+}
+```
+
+When `group_by=event_type` is set but the filtered window contains no events, `by_event_type` is omitted from the response (top-level counters report zero).
 
 ## Configuration
 
@@ -105,6 +134,10 @@ curl -s -H "Authorization: Bearer your-secret-token" \
 # Cross-session cost rollup for a group
 curl -s -H "Authorization: Bearer your-secret-token" \
   'https://opentalon.example.com/api/events/stats?group_id=team-a&since=2024-01-01T00:00:00Z'
+
+# Event-type breakdown + drill-down sample IDs in one round-trip
+curl -s -H "Authorization: Bearer your-secret-token" \
+  'https://opentalon.example.com/api/events/stats?group_id=team-a&group_by=event_type&sample_sessions=3'
 
 # All llm_response events in a session, payload-light
 curl -s -H "Authorization: Bearer your-secret-token" \
