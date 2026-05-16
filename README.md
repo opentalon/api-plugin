@@ -21,7 +21,9 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 `/sessions`, `/events`, and `/events/stats` accept the same shared filter set:
 
 - `entity_id` — opentalon entity (in Timly terms: the **user**); singular
-  form, kept for backward compat. Equivalent to `include_entity_ids=<id>`.
+  form, kept for backward compat. Used alone, it scopes to the same row
+  set as `include_entity_ids=<id>`; when both are set the two predicates
+  AND together.
 - `group_id` — opentalon group (in Timly terms: the **entity**)
 - `include_entity_ids` — comma-separated list of entity_ids to scope rows
   **and** aggregation to. Use it for multi-actor scope (e.g. a support

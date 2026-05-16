@@ -350,6 +350,25 @@ func TestListSessions_IncludeAndExcludeCombine(t *testing.T) {
 	}
 }
 
+func TestListSessions_IncludeWithSingularEntityID(t *testing.T) {
+	// Singular entity_id is an equality predicate, include_entity_ids is
+	// an IN-list — when both are set they AND together. The intersection
+	// narrows: `entity_id=user_1 AND s.entity_id IN ('user_1','user_2')`
+	// resolves to just sess_a (user_1's row), not both rows.
+	w := do(t, newTestHandler(t), "/sessions?entity_id=user_1&include_entity_ids=user_1,user_2")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].ID != "sess_a" {
+		t.Fatalf("Items = %+v, want exactly sess_a (intersection of entity_id and include list)", resp.Items)
+	}
+	if resp.Totals.SessionCount != 1 {
+		t.Errorf("Totals.SessionCount = %d, want 1", resp.Totals.SessionCount)
+	}
+}
+
 func TestListSessions_ExcludeEntityIDs(t *testing.T) {
 	// Single excluded entity_id removes its rows AND its contribution to
 	// totals — the two must always agree (visible rows sum to totals),
