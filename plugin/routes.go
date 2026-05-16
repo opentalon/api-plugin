@@ -171,6 +171,34 @@ type EventStats struct {
 	CostInputTotal  float64           `json:"cost_input_total"`
 	CostOutputTotal float64           `json:"cost_output_total"`
 	ByEventType     []EventTypeBucket `json:"by_event_type,omitempty"`
+	TimeBuckets     []TimeBucket      `json:"time_buckets,omitempty"`
+}
+
+// TimeBucket is one row of the time_buckets[] breakdown, populated only
+// when ?bucket_by=day|week|month|year is set. Bucket is a YYYY-MM-DD
+// date string anchored to the bucket start (Monday for week, 1st for
+// month, Jan 1 for year). All counters are zero when the bucket falls
+// inside [since,until) but contains no events — empty days/weeks/etc.
+// are filled server-side so the consumer can render a continuous x-axis
+// without a "fill missing periods" loop.
+//
+// Sum-consistency: Σ(time_buckets[].cost_*) == top-level cost_*; same
+// for event_count and the call/token counters. SessionCount is the only
+// exception — a session that has events on multiple bucket days is
+// counted once per bucket it touches, but only once at top level
+// (distinct sessions). Σ(time_buckets[].session_count) ≥ top-level
+// session_count therefore, by design — long-running sessions
+// contribute to each bucket they're active in.
+type TimeBucket struct {
+	Bucket          string  `json:"bucket"`
+	SessionCount    int     `json:"session_count"`
+	EventCount      int64   `json:"event_count"`
+	LLMCallCount    int64   `json:"llm_call_count"`
+	ToolCallCount   int64   `json:"tool_call_count"`
+	TokensInTotal   int64   `json:"tokens_in_total"`
+	TokensOutTotal  int64   `json:"tokens_out_total"`
+	CostInputTotal  float64 `json:"cost_input_total"`
+	CostOutputTotal float64 `json:"cost_output_total"`
 }
 
 // EventTypeBucket is one row of the by_event_type breakdown. SampleSessionIDs
@@ -212,6 +240,99 @@ const (
 // the documented ~24-event-type ceiling and 5 IDs per bucket the upper
 // bound is 120 small ID strings.
 const maxSampleSessions = 5
+
+// Granularity values for ?bucket_by= on /events/stats. The set is closed
+// in v1; sub-day granularities (hour/minute) and "all" are intentionally
+// omitted — "single aggregate" is what /events/stats without bucket_by
+// already returns, and hour/minute have a different cap profile so they
+// belong in their own iteration.
+const (
+	bucketByDay   = "day"
+	bucketByWeek  = "week"
+	bucketByMonth = "month"
+	bucketByYear  = "year"
+)
+
+// Per-granularity bucket-count caps. Generous on purpose: the cap is
+// DoS protection (refuse "year-of-empty-days" pathological queries),
+// not a design statement about how far back consumers should chart.
+// Real response size at the cap is bounded — 1200 daily buckets ≈
+// ~220KB JSON / ~25KB gzipped, fine for an analytical endpoint.
+const (
+	maxBucketCountDay   = 1200 // ≈ 3.3 years
+	maxBucketCountWeek  = 520  // ≈ 10 years
+	maxBucketCountMonth = 120  // = 10 years
+	maxBucketCountYear  = 20   // = 20 years
+)
+
+// maxBucketCountFor returns the per-granularity cap. Granularity is
+// validated upstream; an unknown value here is a programmer error and
+// returns 0 (which then fails the "exceeds" check trivially).
+func maxBucketCountFor(granularity string) int {
+	switch granularity {
+	case bucketByDay:
+		return maxBucketCountDay
+	case bucketByWeek:
+		return maxBucketCountWeek
+	case bucketByMonth:
+		return maxBucketCountMonth
+	case bucketByYear:
+		return maxBucketCountYear
+	}
+	return 0
+}
+
+// truncateToBucket UTC-truncates t to the start of the bucket it falls
+// in. Mirrors the SQL DateBucket helper so the Go-side empty-bucket
+// fill iterator generates the exact same keys the SQL groups produce.
+func truncateToBucket(t time.Time, granularity string) time.Time {
+	t = t.UTC()
+	switch granularity {
+	case bucketByDay:
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	case bucketByWeek:
+		// ISO 8601: Monday-anchored. time.Weekday: Sunday=0..Saturday=6.
+		offset := (int(t.Weekday()) + 6) % 7 // Mon→0, Tue→1, …, Sun→6
+		return time.Date(t.Year(), t.Month(), t.Day()-offset, 0, 0, 0, 0, time.UTC)
+	case bucketByMonth:
+		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	case bucketByYear:
+		return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return t
+}
+
+// advanceBucket steps t by exactly one bucket. Used by the empty-bucket
+// fill iterator and by the bucket-count validator. Year/month use
+// AddDate so DST and month-length variability are handled by stdlib.
+func advanceBucket(t time.Time, granularity string) time.Time {
+	switch granularity {
+	case bucketByDay:
+		return t.AddDate(0, 0, 1)
+	case bucketByWeek:
+		return t.AddDate(0, 0, 7)
+	case bucketByMonth:
+		return t.AddDate(0, 1, 0)
+	case bucketByYear:
+		return t.AddDate(1, 0, 0)
+	}
+	return t
+}
+
+// bucketCountExceeds reports whether the number of buckets fully or
+// partially covered by [since, until) exceeds cap. Walks the bucket
+// sequence so it stays correct under month-length / leap-year drift
+// without re-deriving the bucket math per granularity.
+func bucketCountExceeds(since, until time.Time, granularity string, cap int) bool {
+	n := 0
+	for cur := truncateToBucket(since, granularity); cur.Before(until); cur = advanceBucket(cur, granularity) {
+		n++
+		if n > cap {
+			return true
+		}
+	}
+	return false
+}
 
 // Event-type constants mirror events.Type* in opentalon. Keeping the
 // strings local (rather than importing the opentalon Go package just to
@@ -743,6 +864,39 @@ func eventsStatsOptsFromQuery(r *http.Request) (eventsStatsOpts, error) {
 		}
 		opts.SampleSessions = n
 	}
+	if bb := q.Get("bucket_by"); bb != "" {
+		// Granularity allow-list; case-sensitive on purpose so the URL
+		// stays unambiguous and the consumer notices typos.
+		switch bb {
+		case bucketByDay, bucketByWeek, bucketByMonth, bucketByYear:
+		default:
+			return eventsStatsOpts{}, fmt.Errorf(
+				"bucket_by: unsupported value %q (allowed: %s, %s, %s, %s)",
+				bb, bucketByDay, bucketByWeek, bucketByMonth, bucketByYear)
+		}
+		// bucket_by × group_by=event_type would be a cross-tab
+		// (time × event_type matrix). Deferred for v1 — the first
+		// consumer doesn't need it; revisit when an actual chart does.
+		if opts.GroupByEventType {
+			return eventsStatsOpts{}, fmt.Errorf("bucket_by cannot be combined with group_by in v1")
+		}
+		// since/until are mandatory: without them the bucket count is
+		// unbounded ("all events ever, day-by-day"). Better to 400 than
+		// to silently scan the full table or trim with a default window.
+		if f.Since == "" || f.Until == "" {
+			return eventsStatsOpts{}, fmt.Errorf("bucket_by requires both since and until")
+		}
+		sinceT, _ := time.Parse(time.RFC3339, f.Since) // filtersFromQuery already validated
+		untilT, _ := time.Parse(time.RFC3339, f.Until)
+		if !sinceT.Before(untilT) {
+			return eventsStatsOpts{}, fmt.Errorf("bucket_by requires since < until")
+		}
+		cap := maxBucketCountFor(bb)
+		if bucketCountExceeds(sinceT, untilT, bb, cap) {
+			return eventsStatsOpts{}, fmt.Errorf("bucket_by=%s: window exceeds %d buckets (cap)", bb, cap)
+		}
+		opts.BucketBy = bb
+	}
 	return opts, nil
 }
 
@@ -794,10 +948,24 @@ func sessionStatsSelect(d Dialect) string {
 	}, ", ")
 }
 
-// applySessionFilters appends shared filter predicates and args. The
-// sessions table is always aliased as "s" so the JOIN-onto-events queries
-// and the totals query (no JOIN) share this builder without conflict.
+// applySessionFilters appends shared filter predicates and args, with
+// since/until applied to s.created_at (the default for /sessions and
+// the non-bucket /events/stats path). Wrapper around
+// applySessionFiltersOn — kept as the convenience entry point so
+// existing callers don't have to repeat the time-column choice.
 func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
+	applySessionFiltersOn(q, args, f, "s.created_at")
+}
+
+// applySessionFiltersOn is applySessionFilters with explicit choice of
+// the column the since/until predicates apply to. The /events/stats
+// bucket_by path passes "se.ts" so bucket counters stay sum-consistent
+// with top-level totals when one filter axis is the event timestamp
+// rather than the session-create timestamp (a long-running session
+// would otherwise have events landing inside a bucket that fall outside
+// the [since,until) window the user authored). The sessions table is
+// always aliased "s", session_events always "se".
+func applySessionFiltersOn(q *strings.Builder, args *[]any, f sessionFilters, timeCol string) {
 	if f.EntityID != "" {
 		q.WriteString(" AND s.entity_id = ?")
 		*args = append(*args, f.EntityID)
@@ -815,11 +983,11 @@ func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
 	writeInClause(q, args, "s.entity_id", f.IncludeEntityIDs, false)
 	writeInClause(q, args, "s.entity_id", f.ExcludeEntityIDs, true)
 	if f.Since != "" {
-		q.WriteString(" AND s.created_at >= ?")
+		fmt.Fprintf(q, " AND %s >= ?", timeCol)
 		*args = append(*args, f.Since)
 	}
 	if f.Until != "" {
-		q.WriteString(" AND s.created_at < ?")
+		fmt.Fprintf(q, " AND %s < ?", timeCol)
 		*args = append(*args, f.Until)
 	}
 }
@@ -1141,16 +1309,40 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 type eventsStatsOpts struct {
 	Filters          sessionFilters
 	GroupByEventType bool
-	SampleSessions   int // 0 = omit sample_session_ids; 1..maxSampleSessions otherwise
+	SampleSessions   int    // 0 = omit sample_session_ids; 1..maxSampleSessions otherwise
+	BucketBy         string // "" | "day" | "week" | "month" | "year"
 }
 
-// eventsStats is the orchestrator: top-level totals always, plus an
-// optional per-event_type breakdown, plus optional per-bucket session
-// samples. Each piece is its own SQL — counts and samples could be
-// fused with array_agg in Postgres but SQLite's lack of bounded array
-// aggregation pushes us to the portable two-query path. Each query is
-// over the same indexed JOIN, so the round-trip cost stays modest.
+// eventsStats is the orchestrator. Three response shapes:
+//
+//   - Default (no shaping params): top-level aggregates only, filtered
+//     on s.created_at — unchanged contract.
+//   - group_by=event_type [+ sample_sessions]: top-level + by_event_type[].
+//   - bucket_by=day|week|month|year: top-level + time_buckets[], with
+//     since/until applied to se.ts on both queries so Σ(buckets) == top.
+//
+// Each piece is its own SQL — counts and samples could be fused with
+// array_agg in Postgres but SQLite's lack of bounded array aggregation
+// pushes us to the portable per-query path. Each query is over the same
+// indexed JOIN, so the round-trip cost stays modest.
 func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error) {
+	if opts.BucketBy != "" {
+		// Bucket path: totals + buckets both filter on se.ts so the
+		// invariant Σ(time_buckets[].counter) == top-level counter
+		// holds for every counter except session_count (see TimeBucket
+		// godoc for why distinct-session-per-bucket is intentional).
+		stats, err := eventsStatsTotalsOn(db, d, opts.Filters, "se.ts")
+		if err != nil {
+			return EventStats{}, err
+		}
+		sparse, err := eventsStatsTimeBuckets(db, d, opts.Filters, opts.BucketBy)
+		if err != nil {
+			return EventStats{}, err
+		}
+		stats.TimeBuckets = fillEmptyBuckets(sparse, opts.Filters.Since, opts.Filters.Until, opts.BucketBy)
+		return stats, nil
+	}
+
 	stats, err := eventsStatsTotals(db, d, opts.Filters)
 	if err != nil {
 		return EventStats{}, err
@@ -1178,6 +1370,13 @@ func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error
 }
 
 func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, error) {
+	return eventsStatsTotalsOn(db, d, f, "s.created_at")
+}
+
+// eventsStatsTotalsOn is the totals query with a parametrised time
+// column for since/until. Default path (s.created_at) goes through
+// eventsStatsTotals; the bucket_by path calls in directly with se.ts.
+func eventsStatsTotalsOn(db *sql.DB, d Dialect, f sessionFilters, timeCol string) (EventStats, error) {
 	// Cross-session aggregate; same JIT pattern as sessionTotals but
 	// without the per-session GROUP BY. Always JOINs sessions so
 	// entity/group filters work — when neither is set the JOIN is still
@@ -1195,7 +1394,7 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, err
 		FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
 
 	var args []any
-	applySessionFilters(&q, &args, f)
+	applySessionFiltersOn(&q, &args, f, timeCol)
 
 	var stats EventStats
 	row := db.QueryRow(d.Rebind(q.String()), args...)
@@ -1206,6 +1405,104 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, err
 		return EventStats{}, fmt.Errorf("eventsStatsTotals: %w", err)
 	}
 	return stats, nil
+}
+
+// eventsStatsTimeBuckets returns one row per bucket-start key in the
+// filtered window that has at least one event. Filters since/until on
+// se.ts (not s.created_at) so a session created before the window can
+// still contribute to buckets inside it, and vice versa — see the
+// orchestrator comment for the sum-consistency reasoning.
+//
+// The slice is sparse (missing buckets aren't returned); the caller
+// runs it through fillEmptyBuckets to produce a continuous x-axis.
+// Ordering is ASC by bucket so the fill loop can do a single sorted
+// merge instead of building a full lookup map.
+func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity string) ([]TimeBucket, error) {
+	bucketExpr := d.DateBucket("se.ts", granularity)
+
+	var q strings.Builder
+	fmt.Fprintf(&q, `SELECT %s AS bucket,
+		COUNT(DISTINCT s.id),
+		COUNT(se.id),
+		COALESCE(SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END), 0),
+		COALESCE(%s, 0),
+		COALESCE(%s, 0),
+		COALESCE(%s, 0),
+		COALESCE(%s, 0)
+		FROM sessions s JOIN session_events se ON se.session_id = s.id WHERE 1=1`,
+		bucketExpr,
+		eventTypeLLMResponse, eventTypeToolCallResult,
+		llmAggExpr(d, payloadFieldTokensIn, true),
+		llmAggExpr(d, payloadFieldTokensOut, true),
+		llmAggExpr(d, payloadFieldCostInput, false),
+		llmAggExpr(d, payloadFieldCostOutput, false),
+	)
+
+	var args []any
+	applySessionFiltersOn(&q, &args, f, "se.ts")
+
+	// GROUP BY the same expression we project, ORDER BY the bucket
+	// alias. SQLite accepts both forms; Postgres requires the alias or
+	// the full expression — alias is more readable.
+	fmt.Fprintf(&q, ` GROUP BY %s ORDER BY bucket ASC`, bucketExpr)
+
+	rows, err := db.Query(d.Rebind(q.String()), args...)
+	if err != nil {
+		return nil, fmt.Errorf("eventsStatsTimeBuckets: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []TimeBucket
+	for rows.Next() {
+		var b TimeBucket
+		if err := rows.Scan(&b.Bucket, &b.SessionCount, &b.EventCount,
+			&b.LLMCallCount, &b.ToolCallCount,
+			&b.TokensInTotal, &b.TokensOutTotal,
+			&b.CostInputTotal, &b.CostOutputTotal); err != nil {
+			return nil, fmt.Errorf("eventsStatsTimeBuckets scan: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("eventsStatsTimeBuckets rows: %w", err)
+	}
+	return out, nil
+}
+
+// fillEmptyBuckets expands a SQL-returned sparse bucket slice into a
+// continuous one covering every bucket-start key in [since, until).
+// Empty buckets get zero counters so the consumer's chart x-axis is
+// continuous without a client-side fill loop.
+//
+// Bucket-key iteration mirrors the SQL DateBucket truncation, so a
+// bucket present in the DB always lines up with one the iterator
+// produces. Both since and until are pre-validated RFC3339; an
+// unparseable value (shouldn't happen post-validation) yields an empty
+// result — the route handler will return whatever the SQL returned
+// rather than crash on a malformed timestamp.
+func fillEmptyBuckets(sparse []TimeBucket, since, until, granularity string) []TimeBucket {
+	sinceT, err1 := time.Parse(time.RFC3339, since)
+	untilT, err2 := time.Parse(time.RFC3339, until)
+	if err1 != nil || err2 != nil {
+		return sparse
+	}
+
+	have := make(map[string]TimeBucket, len(sparse))
+	for _, b := range sparse {
+		have[b.Bucket] = b
+	}
+
+	out := make([]TimeBucket, 0, len(sparse))
+	for cur := truncateToBucket(sinceT, granularity); cur.Before(untilT); cur = advanceBucket(cur, granularity) {
+		key := cur.Format("2006-01-02")
+		if b, ok := have[key]; ok {
+			out = append(out, b)
+		} else {
+			out = append(out, TimeBucket{Bucket: key})
+		}
+	}
+	return out
 }
 
 // eventsStatsByEventType returns one row per distinct event_type in the

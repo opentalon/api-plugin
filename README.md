@@ -13,7 +13,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 | GET | `/sessions` | Paginated session list, each row with its own JIT-aggregated `stats`, plus `totals` over the full filtered set |
 | GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats` |
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
-| GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions`, optional `group_by=event_type` + `sample_sessions=N` |
+| GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions`, optional `group_by=event_type` + `sample_sessions=N`, optional `bucket_by=day/week/month/year` for time-series |
 | GET | `/prompt-snapshots?sha=...` | Resolve a prompt body by sha256 (referenced from `turn_start` events) |
 
 ### Filters
@@ -118,6 +118,55 @@ To answer "what's going wrong in conversations" in one round-trip instead of N p
 
 When `group_by=event_type` is set but the filtered window contains no events, `by_event_type` is omitted from the response (top-level counters report zero).
 
+#### Time-series buckets on `/events/stats`
+
+For charting cost / token / call-count curves over time without paging through `/sessions` and bucketing client-side, `/events/stats` accepts `bucket_by`:
+
+- `bucket_by=day|week|month|year` — adds a `time_buckets[]` array, one bucket per period in `[since, until)`. Default response shape (without the param) is unchanged.
+- `since` **and** `until` are required when `bucket_by` is set (the time-window bounds bound the result set). Without both, the request is rejected with 400.
+- `bucket_by` cannot be combined with `group_by` in v1 (cross-tab `time × event_type` is deferred until a real consumer needs it).
+
+Bucket-count caps (DoS protection, generous on purpose):
+
+| `bucket_by` | Cap | Approximate window |
+|---|---|---|
+| `day`   | 1200 | ≈ 3.3 years |
+| `week`  |  520 | 10 years |
+| `month` |  120 | 10 years |
+| `year`  |   20 | 20 years |
+
+Exceeding the cap returns 400.
+
+```jsonc
+// GET /events/stats?bucket_by=day&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z&entity_id=u_alice
+{
+  "session_count": 1, "event_count": 2, "llm_call_count": 2, "tool_call_count": 0,
+  "tokens_in_total": 300, "tokens_out_total": 150,
+  "cost_input_total": 0.030, "cost_output_total": 0.060,
+  "time_buckets": [
+    {"bucket":"2026-05-10","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":100,"tokens_out_total":50,"cost_input_total":0.010,"cost_output_total":0.020},
+    {"bucket":"2026-05-11","session_count":0,"event_count":0,"llm_call_count":0,"tool_call_count":0,"tokens_in_total":0,"tokens_out_total":0,"cost_input_total":0,"cost_output_total":0},
+    {"bucket":"2026-05-12","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":200,"tokens_out_total":100,"cost_input_total":0.020,"cost_output_total":0.040},
+    {"bucket":"2026-05-13","session_count":0, …},
+    …
+  ]
+}
+```
+
+**Bucket-key format.** Always `YYYY-MM-DD`, anchored to the bucket start: day = that day, week = Monday of the week (ISO 8601), month = 1st of the month, year = January 1. The format is uniform across granularities so a chart-side date parser handles every response.
+
+**Empty bucket fill.** Periods inside `[since, until)` that contain zero events return a bucket with all-zero counters — the chart x-axis is continuous without a client-side fill loop. Always-present scaffold, even for fully empty windows.
+
+**Edge buckets may be partial.** When `since` / `until` don't align with a bucket boundary (e.g. `bucket_by=month&since=2026-05-13&until=2026-06-10` produces buckets `2026-05-01` and `2026-06-01` where both contain only partial-month data), the bucket-key reflects the natural period start but counters include only events within `[since, until)`. If you need only full buckets, align your window to the granularity yourself.
+
+**Sum-consistency.** For every counter except `session_count`, Σ(`time_buckets[].counter`) == top-level counter. The exception is by design: a session active in more than one bucket period contributes 1 to each bucket's `session_count` but is counted once at top level (distinct sessions). Long-running sessions therefore make Σ(buckets) ≥ top-level for that one field — without it, the per-bucket session count would mis-represent "who was active this day".
+
+**Filter axis under `bucket_by`.** When `bucket_by` is set, `since` / `until` apply to the event timestamp (`session_events.ts`) rather than the session creation time (`sessions.created_at`) used elsewhere. This is what makes Σ(buckets) match top-level for the bucket query path. A session created on the day before `since` but with events inside the window contributes to both totals and buckets.
+
+**Performance hint.** Scope queries with `entity_id`, `include_entity_ids`, or `group_id` for fastest response. Unscoped windows (admin-only "all tenants, multi-year") scan the full event stream — they work but are noticeably slower; the indexing improvement that closes this gap lives in opentalon-core.
+
+**Single aggregate over an arbitrary window.** Omit `bucket_by` entirely — the top-level fields are the single aggregate for `[since, until)`. There is no `bucket_by=all`; the no-param call already serves it.
+
 ## Configuration
 
 ```yaml
@@ -162,6 +211,10 @@ curl -s -H "Authorization: Bearer your-secret-token" \
 # Event-type breakdown + drill-down sample IDs in one round-trip
 curl -s -H "Authorization: Bearer your-secret-token" \
   'https://opentalon.example.com/api/events/stats?group_id=team-a&group_by=event_type&sample_sessions=3'
+
+# Daily cost curve for a tenant over the last 30 days (time-series chart)
+curl -s -H "Authorization: Bearer your-secret-token" \
+  'https://opentalon.example.com/api/events/stats?group_id=team-a&bucket_by=day&since=2026-04-15T00:00:00Z&until=2026-05-15T00:00:00Z'
 
 # All llm_response events in a session, payload-light
 curl -s -H "Authorization: Bearer your-secret-token" \

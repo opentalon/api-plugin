@@ -1282,3 +1282,562 @@ func TestAuthMiddleware(t *testing.T) {
 		t.Errorf("no auth config: status = %d, want 200", w.Code)
 	}
 }
+
+// --- /events/stats?bucket_by=… ---
+
+// seedBucketEvents adds three sessions with deterministic timestamps in
+// 2026-05 / 2026-06 / 2025-07 / 2027-02 to support the time-bucket tests.
+// Layered on top of setupTestDB's existing 2024-01/02 fixtures — those
+// stay outside the bucket-test windows so they don't perturb the
+// expected counts. Returns nothing; the handler reads via h.db.
+//
+// Layout (all UTC):
+//
+//	sess_bk_alice  u_alice/acme    events on 2026-05-10 and 2026-05-12 (same session, two buckets)
+//	sess_bk_bob    u_bob/acme      events on 2026-05-14 (llm + tool_call)
+//	sess_bk_carol  u_carol/globex  event  on 2026-05-16
+//	sess_bk_dave   u_dave/acme     event  on 2026-06-03 (next month, for month-bucket tests)
+//	sess_bk_ed     u_ed/acme       event  on 2025-07-15 (prev year, for year-bucket tests)
+func seedBucketEvents(t *testing.T, db *sql.DB) {
+	t.Helper()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	llm := func(tokIn, tokOut int, costIn, costOut float64) string {
+		return fmt.Sprintf(`{"v":1,"tokens_in":%d,"tokens_out":%d,"cost_input":%g,"cost_output":%g}`,
+			tokIn, tokOut, costIn, costOut)
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','','gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_bk_a1','sess_bk_alice',1,'2026-05-10T10:00:00Z','llm_response',NULL,100,?,'2026-05-10T10:00:00Z')`,
+		llm(100, 50, 0.010, 0.020))
+	exec(`INSERT INTO session_events VALUES ('evt_bk_a2','sess_bk_alice',2,'2026-05-12T10:00:00Z','llm_response',NULL,100,?,'2026-05-12T10:00:00Z')`,
+		llm(200, 100, 0.020, 0.040))
+
+	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','','gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_bk_b1','sess_bk_bob',1,'2026-05-14T10:00:00Z','llm_response',NULL,200,?,'2026-05-14T10:00:00Z')`,
+		llm(300, 150, 0.030, 0.060))
+	exec(`INSERT INTO session_events VALUES ('evt_bk_b2','sess_bk_bob',2,'2026-05-14T11:00:00Z','tool_call_result','evt_bk_b1',50,'{"v":1,"result":"ok"}','2026-05-14T11:00:00Z')`)
+
+	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','','gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_bk_c1','sess_bk_carol',1,'2026-05-16T10:00:00Z','llm_response',NULL,100,?,'2026-05-16T10:00:00Z')`,
+		llm(400, 200, 0.040, 0.080))
+
+	exec(`INSERT INTO sessions VALUES ('sess_bk_dave','','gpt-4o','{}','u_dave','acme','2026-06-03T09:00:00Z','2026-06-03T10:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_bk_d1','sess_bk_dave',1,'2026-06-03T10:00:00Z','llm_response',NULL,100,?,'2026-06-03T10:00:00Z')`,
+		llm(500, 250, 0.050, 0.100))
+
+	exec(`INSERT INTO sessions VALUES ('sess_bk_ed','','gpt-4o','{}','u_ed','acme','2025-07-15T09:00:00Z','2025-07-15T10:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_bk_e1','sess_bk_ed',1,'2025-07-15T10:00:00Z','llm_response',NULL,100,?,'2025-07-15T10:00:00Z')`,
+		llm(600, 300, 0.060, 0.120))
+}
+
+func newBucketHandler(t *testing.T) *Handler {
+	h := newTestHandler(t)
+	seedBucketEvents(t, h.db)
+	return h
+}
+
+// bucketByKey indexes time_buckets by bucket key for compact assertions.
+func bucketByKey(buckets []TimeBucket) map[string]TimeBucket {
+	out := make(map[string]TimeBucket, len(buckets))
+	for _, b := range buckets {
+		out[b.Bucket] = b
+	}
+	return out
+}
+
+// — Issue #11 Test 1 —
+// Verifies presence, ordering, and the populated keys for a 7-day window
+// hitting the seed fixture; covers BucketsAndOrdering from the issue.
+func TestEventsStats_BucketByDay_BucketsAndOrdering(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+
+	wantKeys := []string{
+		"2026-05-10", "2026-05-11", "2026-05-12", "2026-05-13",
+		"2026-05-14", "2026-05-15", "2026-05-16",
+	}
+	if len(stats.TimeBuckets) != len(wantKeys) {
+		t.Fatalf("len(TimeBuckets) = %d, want %d; buckets = %+v",
+			len(stats.TimeBuckets), len(wantKeys), stats.TimeBuckets)
+	}
+	for i, want := range wantKeys {
+		if stats.TimeBuckets[i].Bucket != want {
+			t.Errorf("TimeBuckets[%d].Bucket = %q, want %q", i, stats.TimeBuckets[i].Bucket, want)
+		}
+	}
+}
+
+// — Issue #11 Test 2 — empty days filled in with zero counters.
+func TestEventsStats_BucketByDay_EmptyDaysFilled(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	byKey := bucketByKey(stats.TimeBuckets)
+
+	for _, emptyDay := range []string{"2026-05-11", "2026-05-13", "2026-05-15"} {
+		b, ok := byKey[emptyDay]
+		if !ok {
+			t.Fatalf("expected empty bucket for %s; got buckets = %+v", emptyDay, stats.TimeBuckets)
+		}
+		if b.SessionCount != 0 || b.EventCount != 0 || b.LLMCallCount != 0 ||
+			b.ToolCallCount != 0 || b.TokensInTotal != 0 || b.TokensOutTotal != 0 ||
+			b.CostInputTotal != 0 || b.CostOutputTotal != 0 {
+			t.Errorf("empty bucket %s has non-zero counter: %+v", emptyDay, b)
+		}
+	}
+}
+
+// — Issue #11 Test 3 — narrow window only returns its subset of buckets.
+func TestEventsStats_BucketByDay_RespectsSinceUntil(t *testing.T) {
+	h := newBucketHandler(t)
+	// Narrow to 2026-05-12 and 2026-05-13 only.
+	w := do(t, h, "/events/stats?bucket_by=day&since=2026-05-12T00:00:00Z&until=2026-05-14T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.TimeBuckets) != 2 {
+		t.Fatalf("len(TimeBuckets) = %d, want 2; got %+v", len(stats.TimeBuckets), stats.TimeBuckets)
+	}
+	if stats.TimeBuckets[0].Bucket != "2026-05-12" || stats.TimeBuckets[1].Bucket != "2026-05-13" {
+		t.Errorf("buckets = %+v, want [2026-05-12, 2026-05-13]", stats.TimeBuckets)
+	}
+	// Bucket 2026-05-12 has evt_bk_a2 (sess_bk_alice's second event).
+	if stats.TimeBuckets[0].EventCount != 1 || stats.TimeBuckets[0].TokensInTotal != 200 {
+		t.Errorf("bucket 2026-05-12 = %+v, want EventCount=1, TokensInTotal=200", stats.TimeBuckets[0])
+	}
+}
+
+// — Issue #11 Test 4 — group_id scoping applied to buckets.
+func TestEventsStats_BucketByDay_RespectsGroupID(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&group_id=globex&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	byKey := bucketByKey(stats.TimeBuckets)
+	// Only sess_bk_carol matches; its event is on 2026-05-16.
+	if b := byKey["2026-05-16"]; b.EventCount != 1 || b.TokensInTotal != 400 {
+		t.Errorf("globex on 2026-05-16 = %+v, want EventCount=1, TokensInTotal=400", b)
+	}
+	for _, key := range []string{"2026-05-10", "2026-05-12", "2026-05-14"} {
+		if b := byKey[key]; b.EventCount != 0 {
+			t.Errorf("globex on %s = %+v, want EventCount=0 (different group)", key, b)
+		}
+	}
+	if stats.EventCount != 1 || stats.SessionCount != 1 {
+		t.Errorf("top-level (globex only) = %+v, want EventCount=1 SessionCount=1", stats)
+	}
+}
+
+// — Issue #11 Test 5 — entity_id (singular) scoping applied to buckets.
+func TestEventsStats_BucketByDay_RespectsEntityID(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&entity_id=u_alice&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	byKey := bucketByKey(stats.TimeBuckets)
+	if b := byKey["2026-05-10"]; b.EventCount != 1 || b.TokensInTotal != 100 {
+		t.Errorf("alice on 2026-05-10 = %+v, want EventCount=1 TokensInTotal=100", b)
+	}
+	if b := byKey["2026-05-12"]; b.EventCount != 1 || b.TokensInTotal != 200 {
+		t.Errorf("alice on 2026-05-12 = %+v, want EventCount=1 TokensInTotal=200", b)
+	}
+	// Bob's events on 14, Carol's on 16 must be excluded.
+	for _, key := range []string{"2026-05-14", "2026-05-16"} {
+		if b := byKey[key]; b.EventCount != 0 {
+			t.Errorf("alice on %s = %+v, want EventCount=0 (different user)", key, b)
+		}
+	}
+}
+
+// — Issue #11 Test 6 — include_entity_ids (multi-actor) scoping.
+func TestEventsStats_BucketByDay_RespectsIncludeEntityIDs(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&include_entity_ids=u_alice,u_bob&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	// Alice (10+12) + Bob (14) — carol's 16 excluded.
+	// Top-level totals: 4 events (a1,a2,b1,b2), 3 LLM calls, 1 tool_call,
+	// tokens_in 100+200+300 = 600.
+	if stats.EventCount != 4 || stats.LLMCallCount != 3 || stats.ToolCallCount != 1 {
+		t.Errorf("totals = %+v, want EventCount=4 LLMCallCount=3 ToolCallCount=1", stats)
+	}
+	if stats.TokensInTotal != 600 {
+		t.Errorf("TokensInTotal = %d, want 600", stats.TokensInTotal)
+	}
+	byKey := bucketByKey(stats.TimeBuckets)
+	if b := byKey["2026-05-16"]; b.EventCount != 0 {
+		t.Errorf("carol's day 2026-05-16 = %+v, want EventCount=0 (excluded by include list)", b)
+	}
+}
+
+// — Issue #11 Test 7 — exclude_entity_ids scoping (subtract internal staff).
+func TestEventsStats_BucketByDay_RespectsExcludeEntityIDs(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&exclude_entity_ids=u_alice&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	byKey := bucketByKey(stats.TimeBuckets)
+	// Alice's days (10, 12) must be empty post-exclude.
+	for _, key := range []string{"2026-05-10", "2026-05-12"} {
+		if b := byKey[key]; b.EventCount != 0 {
+			t.Errorf("excluded alice on %s = %+v, want EventCount=0", key, b)
+		}
+	}
+	// Bob (14) and Carol (16) remain.
+	if b := byKey["2026-05-14"]; b.EventCount != 2 {
+		t.Errorf("bob on 2026-05-14 = %+v, want EventCount=2", b)
+	}
+	if b := byKey["2026-05-16"]; b.EventCount != 1 {
+		t.Errorf("carol on 2026-05-16 = %+v, want EventCount=1", b)
+	}
+}
+
+// — Issue #11 Test 8 — bucket_by requires since AND until.
+func TestEventsStats_BucketByDay_RejectedWithoutSinceUntil(t *testing.T) {
+	h := newBucketHandler(t)
+	for _, target := range []string{
+		"/events/stats?bucket_by=day",
+		"/events/stats?bucket_by=day&since=2026-05-10T00:00:00Z",
+		"/events/stats?bucket_by=day&until=2026-05-17T00:00:00Z",
+	} {
+		w := do(t, h, target)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body = %s", target, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "since") || !strings.Contains(w.Body.String(), "until") {
+			t.Errorf("%s: body should name since/until, got %s", target, w.Body.String())
+		}
+	}
+}
+
+// — Issue #11 Test 9 — bucket count above per-granularity cap → 400.
+func TestEventsStats_BucketByDay_RejectedAboveMaxBuckets(t *testing.T) {
+	h := newBucketHandler(t)
+	// 1201 days > maxBucketCountDay (1200).
+	w := do(t, h, "/events/stats?bucket_by=day&since=2023-01-01T00:00:00Z&until=2026-04-17T00:00:00Z")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "buckets") {
+		t.Errorf("body should mention bucket cap, got %s", w.Body.String())
+	}
+}
+
+// — Issue #11 Test 10 — default response shape unchanged when bucket_by absent.
+func TestEventsStats_BucketByDay_DefaultShapeUnchanged(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats")
+	if strings.Contains(w.Body.String(), "time_buckets") {
+		t.Errorf("default response leaked time_buckets key: %s", w.Body.String())
+	}
+}
+
+// — Issue #11 Test 11 (renamed Precedence → Intersection) —
+// entity_id + include_entity_ids AND together (intersection), not
+// precedence. The PR #9 contract is preserved under bucket_by.
+func TestEventsStats_EntityIDVsIncludeEntityIDs_Intersection(t *testing.T) {
+	h := newBucketHandler(t)
+	// Singular pins to alice; the include list adds bob — intersection is
+	// just alice. If precedence semantics applied, both alice + bob would
+	// appear.
+	w := do(t, h, "/events/stats?bucket_by=day&entity_id=u_alice&include_entity_ids=u_alice,u_bob&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	// Alice alone: 2 events on 10 + 12. Bob's 2 events on 14 must not appear.
+	if stats.EventCount != 2 {
+		t.Errorf("EventCount = %d, want 2 (intersection = alice only)", stats.EventCount)
+	}
+	byKey := bucketByKey(stats.TimeBuckets)
+	if b := byKey["2026-05-14"]; b.EventCount != 0 {
+		t.Errorf("bob's day 2026-05-14 = %+v, want EventCount=0 (bob not in intersection)", b)
+	}
+}
+
+// --- Edge cases beyond the issue list ---
+
+// bucket_by + group_by=event_type → 400 (cross-tab deferred in v1).
+func TestEventsStats_BucketByDay_RejectedWithGroupBy(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&group_by=event_type&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "group_by") {
+		t.Errorf("body should mention group_by conflict, got %s", w.Body.String())
+	}
+}
+
+// Unknown bucket_by value → 400 with allow-list in error.
+func TestEventsStats_BucketByDay_RejectedInvalidValue(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=hour&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	for _, allowed := range []string{"day", "week", "month", "year"} {
+		if !strings.Contains(w.Body.String(), allowed) {
+			t.Errorf("body should list %q as allowed, got %s", allowed, w.Body.String())
+		}
+	}
+}
+
+// since == until → 400 (degenerate empty window).
+func TestEventsStats_BucketByDay_RejectedSinceEqualsUntil(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&since=2026-05-10T00:00:00Z&until=2026-05-10T00:00:00Z")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+}
+
+// Σ(time_buckets[].counter) == top-level counter for everything except
+// session_count, which is distinct top-level vs. per-bucket distinct.
+func TestEventsStats_BucketByDay_SumConsistency(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+
+	var (
+		sumEvent          int64
+		sumLLM, sumTool   int64
+		sumTokIn, sumTout int64
+		sumCostIn, sumCo  float64
+		sumSession        int
+	)
+	for _, b := range stats.TimeBuckets {
+		sumEvent += b.EventCount
+		sumLLM += b.LLMCallCount
+		sumTool += b.ToolCallCount
+		sumTokIn += b.TokensInTotal
+		sumTout += b.TokensOutTotal
+		sumCostIn += b.CostInputTotal
+		sumCo += b.CostOutputTotal
+		sumSession += b.SessionCount
+	}
+	if sumEvent != stats.EventCount {
+		t.Errorf("sum EventCount = %d, top-level = %d", sumEvent, stats.EventCount)
+	}
+	if sumLLM != stats.LLMCallCount {
+		t.Errorf("sum LLMCallCount = %d, top-level = %d", sumLLM, stats.LLMCallCount)
+	}
+	if sumTool != stats.ToolCallCount {
+		t.Errorf("sum ToolCallCount = %d, top-level = %d", sumTool, stats.ToolCallCount)
+	}
+	if sumTokIn != stats.TokensInTotal {
+		t.Errorf("sum TokensInTotal = %d, top-level = %d", sumTokIn, stats.TokensInTotal)
+	}
+	if sumTout != stats.TokensOutTotal {
+		t.Errorf("sum TokensOutTotal = %d, top-level = %d", sumTout, stats.TokensOutTotal)
+	}
+	if sumCostIn != stats.CostInputTotal {
+		t.Errorf("sum CostInputTotal = %g, top-level = %g", sumCostIn, stats.CostInputTotal)
+	}
+	if sumCo != stats.CostOutputTotal {
+		t.Errorf("sum CostOutputTotal = %g, top-level = %g", sumCo, stats.CostOutputTotal)
+	}
+	// session_count: alice spans 10 and 12 → counted in 2 buckets, but
+	// top-level distinct = 1 for her. With bob (14) and carol (16) the
+	// sum should be 4, top-level 3. Documented invariant: ≥, not ==.
+	if sumSession < stats.SessionCount {
+		t.Errorf("Σ buckets session_count = %d, top-level = %d (must be ≥)", sumSession, stats.SessionCount)
+	}
+	if sumSession != 4 || stats.SessionCount != 3 {
+		t.Errorf("session counts = (Σ=%d, top=%d), want (4, 3) for the seed fixture", sumSession, stats.SessionCount)
+	}
+}
+
+// A session active on two distinct days contributes session_count=1 to
+// each of its day-buckets — the doc-warned multi-counting behaviour.
+func TestEventsStats_BucketByDay_SessionSpansMultipleBucketsCounted(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&entity_id=u_alice&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	byKey := bucketByKey(stats.TimeBuckets)
+	if b := byKey["2026-05-10"]; b.SessionCount != 1 {
+		t.Errorf("alice 2026-05-10 SessionCount = %d, want 1", b.SessionCount)
+	}
+	if b := byKey["2026-05-12"]; b.SessionCount != 1 {
+		t.Errorf("alice 2026-05-12 SessionCount = %d, want 1", b.SessionCount)
+	}
+	// Top-level distinct session for alice = 1 (sess_bk_alice only).
+	if stats.SessionCount != 1 {
+		t.Errorf("alice top-level SessionCount = %d, want 1", stats.SessionCount)
+	}
+}
+
+// Empty window (no events at all) still returns the full bucket scaffold
+// with all-zero counters — keeps the chart x-axis continuous.
+func TestEventsStats_BucketByDay_EmptyWindowAllZeros(t *testing.T) {
+	h := newBucketHandler(t)
+	// 2030 has no fixture events at all.
+	w := do(t, h, "/events/stats?bucket_by=day&since=2030-01-01T00:00:00Z&until=2030-01-04T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.TimeBuckets) != 3 {
+		t.Fatalf("len(TimeBuckets) = %d, want 3 (full scaffold even with zero events); got %+v",
+			len(stats.TimeBuckets), stats.TimeBuckets)
+	}
+	for _, b := range stats.TimeBuckets {
+		if b.EventCount != 0 || b.SessionCount != 0 {
+			t.Errorf("bucket %s should be all zeros, got %+v", b.Bucket, b)
+		}
+	}
+	if stats.EventCount != 0 || stats.SessionCount != 0 {
+		t.Errorf("top-level should be all zeros, got %+v", stats)
+	}
+}
+
+// --- Granularity-specific tests ---
+
+// Week buckets are Monday-anchored (ISO 8601), regardless of the day
+// since/until falls on.
+func TestEventsStats_BucketByWeek_MondayStart(t *testing.T) {
+	h := newBucketHandler(t)
+	// 2026-05-10 is a Sunday. The week containing 10/12/14/16 starts on
+	// 2026-05-04 (Monday) for the 4–10 window; the week 11–17 starts on
+	// 2026-05-11. Querying since/until that spans both weeks:
+	w := do(t, h, "/events/stats?bucket_by=week&since=2026-05-04T00:00:00Z&until=2026-05-18T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	// Expect two Monday-anchored buckets.
+	if len(stats.TimeBuckets) != 2 {
+		t.Fatalf("len(TimeBuckets) = %d, want 2; got %+v", len(stats.TimeBuckets), stats.TimeBuckets)
+	}
+	wantKeys := []string{"2026-05-04", "2026-05-11"}
+	for i, key := range wantKeys {
+		if stats.TimeBuckets[i].Bucket != key {
+			t.Errorf("TimeBuckets[%d].Bucket = %q, want %q", i, stats.TimeBuckets[i].Bucket, key)
+		}
+	}
+	// Week 2026-05-04 contains alice on Sun 2026-05-10 only.
+	if stats.TimeBuckets[0].EventCount != 1 {
+		t.Errorf("week 2026-05-04 EventCount = %d, want 1 (alice's Sunday event)", stats.TimeBuckets[0].EventCount)
+	}
+	// Week 2026-05-11 contains alice (12), bob (14×2), carol (16).
+	if stats.TimeBuckets[1].EventCount != 4 {
+		t.Errorf("week 2026-05-11 EventCount = %d, want 4", stats.TimeBuckets[1].EventCount)
+	}
+}
+
+// Month bucket keys are the 1st of the month.
+func TestEventsStats_BucketByMonth_FirstOfMonth(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=month&since=2026-05-01T00:00:00Z&until=2026-07-01T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.TimeBuckets) != 2 {
+		t.Fatalf("len = %d, want 2; got %+v", len(stats.TimeBuckets), stats.TimeBuckets)
+	}
+	if stats.TimeBuckets[0].Bucket != "2026-05-01" || stats.TimeBuckets[1].Bucket != "2026-06-01" {
+		t.Errorf("buckets = [%q, %q], want [2026-05-01, 2026-06-01]",
+			stats.TimeBuckets[0].Bucket, stats.TimeBuckets[1].Bucket)
+	}
+	// May has alice (2) + bob (2) + carol (1) = 5 events.
+	if stats.TimeBuckets[0].EventCount != 5 {
+		t.Errorf("May EventCount = %d, want 5", stats.TimeBuckets[0].EventCount)
+	}
+	// June has dave (1).
+	if stats.TimeBuckets[1].EventCount != 1 {
+		t.Errorf("June EventCount = %d, want 1", stats.TimeBuckets[1].EventCount)
+	}
+}
+
+// Year bucket keys are Jan 1, partial edge buckets are OK.
+func TestEventsStats_BucketByYear_JanuaryFirst(t *testing.T) {
+	h := newBucketHandler(t)
+	// 2025 has Ed's event; 2026 has alice/bob/carol/dave.
+	w := do(t, h, "/events/stats?bucket_by=year&since=2025-01-01T00:00:00Z&until=2027-01-01T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.TimeBuckets) != 2 {
+		t.Fatalf("len = %d, want 2; got %+v", len(stats.TimeBuckets), stats.TimeBuckets)
+	}
+	if stats.TimeBuckets[0].Bucket != "2025-01-01" || stats.TimeBuckets[1].Bucket != "2026-01-01" {
+		t.Errorf("buckets = [%q, %q], want [2025-01-01, 2026-01-01]",
+			stats.TimeBuckets[0].Bucket, stats.TimeBuckets[1].Bucket)
+	}
+	if stats.TimeBuckets[0].EventCount != 1 {
+		t.Errorf("2025 EventCount = %d, want 1 (ed only)", stats.TimeBuckets[0].EventCount)
+	}
+	// 2026: alice(2) + bob(2) + carol(1) + dave(1) = 6.
+	if stats.TimeBuckets[1].EventCount != 6 {
+		t.Errorf("2026 EventCount = %d, want 6", stats.TimeBuckets[1].EventCount)
+	}
+}
+
+// Edge buckets are allowed to be partial: bucket-key reflects the
+// natural period, but counters only include events inside [since, until).
+func TestEventsStats_BucketByMonth_EdgeBucketsPartial(t *testing.T) {
+	h := newBucketHandler(t)
+	// Window 2026-05-13 → 2026-06-10. May bucket (key 2026-05-01) only
+	// contains events from 13 onwards; June bucket (key 2026-06-01) only
+	// up to 10. May data on/after 13: bob(2)+carol(1)=3 (alice 10+12 excluded).
+	// June data through 10: dave on 06-03 = 1.
+	w := do(t, h, "/events/stats?bucket_by=month&since=2026-05-13T00:00:00Z&until=2026-06-10T00:00:00Z")
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.TimeBuckets) != 2 {
+		t.Fatalf("len = %d, want 2; got %+v", len(stats.TimeBuckets), stats.TimeBuckets)
+	}
+	if stats.TimeBuckets[0].Bucket != "2026-05-01" {
+		t.Errorf("first edge bucket = %q, want 2026-05-01 (natural month start, partial)", stats.TimeBuckets[0].Bucket)
+	}
+	if stats.TimeBuckets[0].EventCount != 3 {
+		t.Errorf("partial May EventCount = %d, want 3 (only 13 onwards)", stats.TimeBuckets[0].EventCount)
+	}
+	if stats.TimeBuckets[1].EventCount != 1 {
+		t.Errorf("partial June EventCount = %d, want 1", stats.TimeBuckets[1].EventCount)
+	}
+	// Sum invariant survives partial edges.
+	if stats.EventCount != 4 {
+		t.Errorf("top-level EventCount = %d, want 4 (= sum of partial buckets)", stats.EventCount)
+	}
+}
+
+// --- bucketCountExceeds unit coverage (off-by-one boundary) ---
+// At exactly the cap, the request must succeed; one bucket over, it 400s.
+func TestEventsStats_BucketByDay_BoundaryAtCap(t *testing.T) {
+	h := newBucketHandler(t)
+	// Exactly 1200 daily buckets — at the cap, not over. since...until
+	// spans 1200 days; truncation in fillEmptyBuckets is identical to the
+	// validator, so this is the precise off-by-one we want to lock in.
+	since := "2024-01-01T00:00:00Z"
+	until := "2027-04-15T00:00:00Z" // 2024 (366) + 2025 (365) + 2026 (365) + 104 = 1200
+	w := do(t, h, fmt.Sprintf("/events/stats?bucket_by=day&since=%s&until=%s", since, until))
+	if w.Code != http.StatusOK {
+		t.Fatalf("at-cap (1200 days) status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if len(stats.TimeBuckets) != 1200 {
+		t.Errorf("at-cap len = %d, want 1200", len(stats.TimeBuckets))
+	}
+
+	// One day over: 1201 → 400.
+	overUntil := "2027-04-16T00:00:00Z"
+	w = do(t, h, fmt.Sprintf("/events/stats?bucket_by=day&since=%s&until=%s", since, overUntil))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("over-cap (1201 days) status = %d, want 400", w.Code)
+	}
+}
