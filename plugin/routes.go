@@ -246,18 +246,20 @@ func limitFromQuery(r *http.Request) int {
 	}
 }
 
-// cursorPair is the (created_at, id) anchor for cursor pagination.
+// cursorPair is the (sort-key-value, id) anchor for cursor pagination on
+// /events. /sessions uses sessionCursor instead, which additionally
+// records the active sort identifier — see the comment on that type.
 //
-// Why a composite cursor: session IDs aren't k-sortable (opentalon
-// generates them per-actor), so "created_at < ?" alone is non-unique
-// across concurrent inserts. The composite WHERE clause:
+// Why a composite cursor: row IDs aren't k-sortable (opentalon generates
+// them per-actor), so "<key> < ?" alone is non-unique across concurrent
+// inserts. The composite WHERE clause:
 //
-//	created_at < ? OR (created_at = ? AND id < ?)
+//	<key> < ? OR (<key> = ? AND id < ?)
 //
-// gives a total order that survives reseeds and duplicate timestamps.
-// Encoding is base64url over "<ts>|<id>" — opaque to clients (they
-// copy the next_cursor blindly) so we can change the shape later
-// without breaking the contract.
+// gives a total order that survives reseeds and duplicate keys. Encoding
+// is base64url over "<value>|<id>" — opaque to clients (they copy
+// next_cursor blindly) so we can change the shape later without breaking
+// the contract.
 type cursorPair struct {
 	TS string
 	ID string
@@ -284,6 +286,56 @@ func decodeCursor(s string) (cursorPair, error) {
 		return cursorPair{}, fmt.Errorf("cursor: malformed")
 	}
 	return cursorPair{TS: parts[0], ID: parts[1]}, nil
+}
+
+// sessionCursor is the per-page anchor for /sessions. Unlike cursorPair
+// it carries the active sort identifier (key + direction) alongside the
+// boundary value, so a cursor minted under `sort=cost_total&direction=desc`
+// is rejected with 400 when replayed against a different sort context —
+// "the cursor would walk a meaningless keyset" is a documented failure
+// mode of switching sort mid-pagination.
+//
+// Wire format is base64url over "<sort>|<direction>|<value>|<id>" (four
+// fields). For backward compat with cursors minted before sort was
+// configurable, the decoder also accepts the legacy two-field
+// "<value>|<id>" shape and interprets it as the default sort
+// (created_at, desc) so in-flight cursors survive deploys.
+type sessionCursor struct {
+	Sort  sessionSort
+	Value string
+	ID    string
+}
+
+func encodeSessionCursor(c sessionCursor) string {
+	if c.Value == "" && c.ID == "" {
+		return ""
+	}
+	raw := c.Sort.Key + "|" + c.Sort.Direction + "|" + c.Value + "|" + c.ID
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func decodeSessionCursor(s string) (sessionCursor, error) {
+	if s == "" {
+		return sessionCursor{}, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return sessionCursor{}, fmt.Errorf("cursor: invalid encoding")
+	}
+	parts := strings.Split(string(raw), "|")
+	switch len(parts) {
+	case 2:
+		// Pre-sort cursor: created_at DESC implicit.
+		return sessionCursor{Sort: defaultSessionSort, Value: parts[0], ID: parts[1]}, nil
+	case 4:
+		return sessionCursor{
+			Sort:  sessionSort{Key: parts[0], Direction: parts[1]},
+			Value: parts[2],
+			ID:    parts[3],
+		}, nil
+	default:
+		return sessionCursor{}, fmt.Errorf("cursor: malformed")
+	}
 }
 
 // timeRangeFromQuery reads ?since= / ?until= as RFC3339 timestamps. An
@@ -362,6 +414,147 @@ func filtersFromQuery(r *http.Request) (sessionFilters, error) {
 // and (b) produce a NOT IN with thousands of placeholders.
 const maxExcludeEntityIDs = 200
 
+// --- /sessions sort ---
+
+// Sort-key constants are duplicated as the public query-string vocabulary,
+// so the keys also appear in the README. Add a new key in three places:
+// the constant block, sessionSortFromQuery's allow-list, and
+// resolveSessionSort's switch.
+const (
+	sortKeyCreatedAt     = "created_at"
+	sortKeyCostTotal     = "cost_total"
+	sortKeyLLMCallCount  = "llm_call_count"
+	sortKeyToolCallCount = "tool_call_count"
+	sortKeyTokensIn      = "tokens_in_total"
+	sortKeyTokensOut     = "tokens_out_total"
+
+	sortDirAsc  = "asc"
+	sortDirDesc = "desc"
+)
+
+// sessionSort is the parsed sort spec from the query string. Zero value
+// (both fields empty) is illegal — sessionSortFromQuery always fills in
+// the default before returning.
+type sessionSort struct {
+	Key       string
+	Direction string
+}
+
+var defaultSessionSort = sessionSort{Key: sortKeyCreatedAt, Direction: sortDirDesc}
+
+// sessionSortDef is the dialect-resolved form: the SQL expression to
+// splice into ORDER BY (and HAVING for aggregate sorts), plus the
+// per-row extractor / cursor parser that handle the boundary value's
+// Go type round-trip.
+type sessionSortDef struct {
+	sessionSort
+	Expr        string                        // SQL fragment, ready to splice
+	IsAggregate bool                          // → cursor predicate lives in HAVING, not WHERE
+	Extract     func(SessionListItem) string  // serialize a row's sort value into the cursor string
+	BindValue   func(raw string) (any, error) // parse the cursor string back into the typed Go value used as a SQL bind
+}
+
+// sessionSortFromQuery validates ?sort= / ?direction= and fills defaults.
+// Returns 400-shaped errors for unknown keys so the consumer learns the
+// allow-list instead of silently getting a created_at sort back.
+func sessionSortFromQuery(r *http.Request) (sessionSort, error) {
+	s := r.URL.Query().Get("sort")
+	d := r.URL.Query().Get("direction")
+	if s == "" {
+		s = defaultSessionSort.Key
+	}
+	if d == "" {
+		d = defaultSessionSort.Direction
+	}
+	switch s {
+	case sortKeyCreatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
+		sortKeyToolCallCount, sortKeyTokensIn, sortKeyTokensOut:
+	default:
+		return sessionSort{}, fmt.Errorf(
+			"sort: unsupported key %q (allowed: %s, %s, %s, %s, %s, %s)",
+			s, sortKeyCreatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
+			sortKeyToolCallCount, sortKeyTokensIn, sortKeyTokensOut)
+	}
+	switch d {
+	case sortDirAsc, sortDirDesc:
+	default:
+		return sessionSort{}, fmt.Errorf("direction: must be %q or %q, got %q", sortDirAsc, sortDirDesc, d)
+	}
+	return sessionSort{Key: s, Direction: d}, nil
+}
+
+// resolveSessionSort returns the dialect-resolved sort definition for the
+// given (validated) sort spec. The aggregate expressions exactly mirror
+// the projections in sessionStatsSelect so the cursor boundary value
+// extracted from a row's stats matches what HAVING compares against.
+func resolveSessionSort(s sessionSort, d Dialect) sessionSortDef {
+	def := sessionSortDef{sessionSort: s}
+	switch s.Key {
+	case sortKeyCreatedAt:
+		def.Expr = "s.created_at"
+		def.Extract = func(r SessionListItem) string { return r.CreatedAt }
+		def.BindValue = func(raw string) (any, error) { return raw, nil }
+	case sortKeyCostTotal:
+		def.Expr = llmAggExpr(d, payloadFieldCostInput, false) + " + " + llmAggExpr(d, payloadFieldCostOutput, false)
+		def.IsAggregate = true
+		def.Extract = func(r SessionListItem) string {
+			return strconv.FormatFloat(r.Stats.CostInputTotal+r.Stats.CostOutputTotal, 'f', -1, 64)
+		}
+		def.BindValue = func(raw string) (any, error) { return strconv.ParseFloat(raw, 64) }
+	case sortKeyLLMCallCount:
+		def.Expr = fmt.Sprintf("SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END)", eventTypeLLMResponse)
+		def.IsAggregate = true
+		def.Extract = func(r SessionListItem) string { return strconv.Itoa(r.Stats.LLMCallCount) }
+		def.BindValue = func(raw string) (any, error) { return strconv.ParseInt(raw, 10, 64) }
+	case sortKeyToolCallCount:
+		def.Expr = fmt.Sprintf("SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END)", eventTypeToolCallResult)
+		def.IsAggregate = true
+		def.Extract = func(r SessionListItem) string { return strconv.Itoa(r.Stats.ToolCallCount) }
+		def.BindValue = func(raw string) (any, error) { return strconv.ParseInt(raw, 10, 64) }
+	case sortKeyTokensIn:
+		def.Expr = llmAggExpr(d, payloadFieldTokensIn, true)
+		def.IsAggregate = true
+		def.Extract = func(r SessionListItem) string { return strconv.FormatInt(r.Stats.TokensInTotal, 10) }
+		def.BindValue = func(raw string) (any, error) { return strconv.ParseInt(raw, 10, 64) }
+	case sortKeyTokensOut:
+		def.Expr = llmAggExpr(d, payloadFieldTokensOut, true)
+		def.IsAggregate = true
+		def.Extract = func(r SessionListItem) string { return strconv.FormatInt(r.Stats.TokensOutTotal, 10) }
+		def.BindValue = func(raw string) (any, error) { return strconv.ParseInt(raw, 10, 64) }
+	}
+	return def
+}
+
+// keysetCmp builds the composite-keyset comparison predicate for cursor
+// pagination against `expr`, with `s.id` as the deterministic tiebreaker.
+// Caller appends three args in (boundary, boundary, id) order.
+//
+//	DESC: (expr <  ? OR (expr =  ? AND s.id <  ?))
+//	ASC:  (expr >  ? OR (expr =  ? AND s.id >  ?))
+func keysetCmp(expr, direction string) string {
+	cmp := "<"
+	if direction == sortDirAsc {
+		cmp = ">"
+	}
+	return fmt.Sprintf("(%s %s ? OR (%s = ? AND s.id %s ?))", expr, cmp, expr, cmp)
+}
+
+// validateCursorMatchesSort 400s on a cursor whose embedded sort doesn't
+// match the active request sort. Switching sort mid-pagination would
+// otherwise walk a meaningless keyset (the boundary value is in the old
+// sort's space, not the new one's) — failing fast surfaces the consumer
+// bug instead of returning silently-wrong pages.
+func validateCursorMatchesSort(c sessionCursor, want sessionSort) error {
+	if c.Value == "" && c.ID == "" {
+		return nil
+	}
+	if c.Sort != want {
+		return fmt.Errorf("cursor: sort %s/%s does not match request %s/%s",
+			c.Sort.Key, c.Sort.Direction, want.Key, want.Direction)
+	}
+	return nil
+}
+
 // parseCommaList splits a comma-separated query value into trimmed,
 // non-empty tokens. Returns nil for an empty/whitespace-only input so
 // callers can branch on len(...) without a separate "is set" flag.
@@ -418,14 +611,23 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	cur, err := decodeCursor(r.URL.Query().Get("cursor"))
+	sort, err := sessionSortFromQuery(r)
 	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cur, err := decodeSessionCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateCursorMatchesSort(cur, sort); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	limit := limitFromQuery(r)
 
-	items, next, err := listSessions(h.db, h.dialect, f, cur, limit)
+	items, next, err := listSessions(h.db, h.dialect, f, sort, cur, limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -438,7 +640,7 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, SessionListResponse{
 		Items:      items,
 		Totals:     totals,
-		NextCursor: encodeCursor(next),
+		NextCursor: encodeSessionCursor(next),
 	})
 }
 
@@ -608,7 +810,9 @@ func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
 	}
 }
 
-func listSessions(db *sql.DB, d Dialect, f sessionFilters, cur cursorPair, limit int) ([]SessionListItem, cursorPair, error) {
+func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur sessionCursor, limit int) ([]SessionListItem, sessionCursor, error) {
+	def := resolveSessionSort(sort, d)
+
 	var q strings.Builder
 	q.WriteString(`SELECT s.id, COALESCE(s.entity_id,''), COALESCE(s.group_id,''),
 		COALESCE(s.summary,''), COALESCE(s.active_model,''),
@@ -618,12 +822,47 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, cur cursorPair, limit
 
 	var args []any
 	applySessionFilters(&q, &args, f)
-	if cur.TS != "" {
-		q.WriteString(` AND (s.created_at < ? OR (s.created_at = ? AND s.id < ?))`)
-		args = append(args, cur.TS, cur.TS, cur.ID)
+
+	// Cursor predicate: per-row sort keys (created_at) compare in WHERE so
+	// they prune before GROUP BY; aggregate sort keys (cost_total, token
+	// counts, …) must be in HAVING since the value only exists post-aggregation.
+	// Argument order stays {filters, cursor, limit} in both branches because
+	// HAVING's args follow WHERE's positionally in the rebound SQL.
+	var (
+		havingCursor    bool
+		cursorBindValue any
+	)
+	if cur.ID != "" {
+		v, err := def.BindValue(cur.Value)
+		if err != nil {
+			return nil, sessionCursor{}, fmt.Errorf("cursor: parse boundary: %w", err)
+		}
+		cursorBindValue = v
+		if def.IsAggregate {
+			havingCursor = true
+		} else {
+			q.WriteString(" AND ")
+			q.WriteString(keysetCmp(def.Expr, sort.Direction))
+			args = append(args, cursorBindValue, cursorBindValue, cur.ID)
+		}
 	}
+
 	q.WriteString(` GROUP BY s.id, s.entity_id, s.group_id, s.summary, s.active_model, s.created_at, s.updated_at`)
-	q.WriteString(` ORDER BY s.created_at DESC, s.id DESC LIMIT ?`)
+	if havingCursor {
+		q.WriteString(" HAVING ")
+		q.WriteString(keysetCmp(def.Expr, sort.Direction))
+		args = append(args, cursorBindValue, cursorBindValue, cur.ID)
+	}
+
+	orderDir := "DESC"
+	if sort.Direction == sortDirAsc {
+		orderDir = "ASC"
+	}
+	// ORDER BY repeats the expression rather than aliasing to keep both
+	// dialects on the same plan; column aliases in ORDER BY are portable
+	// but mixing alias-in-ORDER-BY with expression-in-HAVING is asymmetric
+	// and a magnet for typo drift between the two sites.
+	fmt.Fprintf(&q, ` ORDER BY %s %s, s.id %s LIMIT ?`, def.Expr, orderDir, orderDir)
 	// limit+1 trick: probe whether a next page exists without a separate
 	// COUNT query. Trim the extra row before returning; if it was there,
 	// the last KEPT row supplies the next cursor.
@@ -631,7 +870,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, cur cursorPair, limit
 
 	rows, err := db.Query(d.Rebind(q.String()), args...)
 	if err != nil {
-		return nil, cursorPair{}, fmt.Errorf("listSessions: %w", err)
+		return nil, sessionCursor{}, fmt.Errorf("listSessions: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -643,18 +882,18 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, cur cursorPair, limit
 			&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 			&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 			&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal); err != nil {
-			return nil, cursorPair{}, fmt.Errorf("listSessions scan: %w", err)
+			return nil, sessionCursor{}, fmt.Errorf("listSessions scan: %w", err)
 		}
 		items = append(items, s)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, cursorPair{}, err
+		return nil, sessionCursor{}, err
 	}
 
-	var next cursorPair
+	var next sessionCursor
 	if len(items) > limit {
 		last := items[limit-1]
-		next = cursorPair{TS: last.CreatedAt, ID: last.ID}
+		next = sessionCursor{Sort: sort, Value: def.Extract(last), ID: last.ID}
 		items = items[:limit]
 	}
 	return items, next, nil

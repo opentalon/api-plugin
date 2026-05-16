@@ -36,9 +36,18 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 - `event_type` — exact match (e.g. `llm_response`, `tool_call_result`)
 - `include_payload=false` — omit payloads (smaller responses, no JOIN cost change)
 
+### Sort (`/sessions`)
+
+`/sessions` accepts `sort` + `direction` for analytics use cases ("top N sessions by cost", "highest tool-call counts"). Defaults preserve the pre-#8 contract.
+
+- `sort` (default `created_at`) — one of: `created_at`, `cost_total`, `llm_call_count`, `tool_call_count`, `tokens_in_total`, `tokens_out_total`. `cost_total` is `cost_input_total + cost_output_total`.
+- `direction` (default `desc`) — `asc` or `desc`.
+
+The cursor encodes the active sort identifier; replaying a cursor under a different `sort`/`direction` returns 400 ("cursor sort mismatch") rather than walking a meaningless keyset. Legacy two-field cursors minted before this feature are accepted under the default sort for back-compat.
+
 ### Pagination
 
-`/sessions` and `/events` use composite cursor pagination on `(created_at, id)` resp. `(ts, id)`. The response carries `next_cursor` (an opaque base64url blob); pass it back as `?cursor=...` to fetch the next page. Empty `next_cursor` means last page.
+`/sessions` and `/events` use composite cursor pagination on `(sort-key-value, id)`. The response carries `next_cursor` (an opaque base64url blob); pass it back as `?cursor=...` to fetch the next page. Empty `next_cursor` means last page.
 
 ### Response shape
 
