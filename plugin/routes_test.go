@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -218,6 +219,268 @@ func TestListSessions_CursorPagination(t *testing.T) {
 	}
 	if page2.NextCursor != "" {
 		t.Errorf("page 2: NextCursor = %q, want empty (last page)", page2.NextCursor)
+	}
+}
+
+// TestListSessions_SortDefaultUnchanged guards the backward-compat promise
+// for the sort extension: omitting `sort` and `direction` keeps the
+// `created_at DESC` shape that consumers relied on pre-#8.
+func TestListSessions_SortDefaultUnchanged(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 2 || resp.Items[0].ID != "sess_b" || resp.Items[1].ID != "sess_a" {
+		t.Errorf("default order = %v, want [sess_b sess_a] (created_at DESC)", []string{resp.Items[0].ID, resp.Items[1].ID})
+	}
+}
+
+func TestListSessions_SortByCreatedAtAsc(t *testing.T) {
+	// Direction flip with the same key — oldest first.
+	w := do(t, newTestHandler(t), "/sessions?sort=created_at&direction=asc")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_a" || resp.Items[1].ID != "sess_b" {
+		t.Errorf("ASC order = %v, want [sess_a sess_b]", []string{resp.Items[0].ID, resp.Items[1].ID})
+	}
+}
+
+func TestListSessions_SortByLLMCallCount(t *testing.T) {
+	// sess_a: 2 llm_response. sess_b: 1. DESC ⇒ sess_a first.
+	w := do(t, newTestHandler(t), "/sessions?sort=llm_call_count&direction=desc")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_a" || resp.Items[1].ID != "sess_b" {
+		t.Errorf("DESC by llm_call_count = %v, want [sess_a sess_b]", []string{resp.Items[0].ID, resp.Items[1].ID})
+	}
+
+	w = do(t, newTestHandler(t), "/sessions?sort=llm_call_count&direction=asc")
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_b" || resp.Items[1].ID != "sess_a" {
+		t.Errorf("ASC by llm_call_count = %v, want [sess_b sess_a]", []string{resp.Items[0].ID, resp.Items[1].ID})
+	}
+}
+
+func TestListSessions_SortByToolCallCount(t *testing.T) {
+	// sess_b: 1 tool_call_result. sess_a: 0. DESC ⇒ sess_b first.
+	w := do(t, newTestHandler(t), "/sessions?sort=tool_call_count&direction=desc")
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_b" || resp.Items[1].ID != "sess_a" {
+		t.Errorf("DESC by tool_call_count = %v, want [sess_b sess_a]", []string{resp.Items[0].ID, resp.Items[1].ID})
+	}
+}
+
+func TestListSessions_SortByTokensInTotal(t *testing.T) {
+	// sess_a: tokens_in=3000. sess_b: 500. DESC ⇒ sess_a first.
+	w := do(t, newTestHandler(t), "/sessions?sort=tokens_in_total&direction=desc")
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_a" {
+		t.Errorf("DESC by tokens_in_total: items[0] = %q, want sess_a", resp.Items[0].ID)
+	}
+}
+
+func TestListSessions_SortByTokensOutTotal(t *testing.T) {
+	// sess_a: tokens_out=1500. sess_b: 250.
+	w := do(t, newTestHandler(t), "/sessions?sort=tokens_out_total&direction=desc")
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_a" {
+		t.Errorf("DESC by tokens_out_total: items[0] = %q, want sess_a", resp.Items[0].ID)
+	}
+}
+
+func TestListSessions_SortByCostTotal(t *testing.T) {
+	// sess_a cost = 0.0075 + 0.015 = 0.0225. sess_b cost = 0.00125 + 0.0025 = 0.00375.
+	w := do(t, newTestHandler(t), "/sessions?sort=cost_total&direction=desc")
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_a" {
+		t.Errorf("DESC by cost_total: items[0] = %q, want sess_a", resp.Items[0].ID)
+	}
+	w = do(t, newTestHandler(t), "/sessions?sort=cost_total&direction=asc")
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_b" {
+		t.Errorf("ASC by cost_total: items[0] = %q, want sess_b", resp.Items[0].ID)
+	}
+}
+
+// TestListSessions_SortCursorWalk_Aggregate covers the HAVING-clause branch
+// of cursor pagination — without it, the cursor predicate would land in
+// WHERE and the boundary value (which only exists after GROUP BY) would
+// not match anything, returning an empty second page.
+func TestListSessions_SortCursorWalk_Aggregate(t *testing.T) {
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?sort=cost_total&direction=desc&limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if len(page1.Items) != 1 || page1.Items[0].ID != "sess_a" {
+		t.Fatalf("page 1 = %+v, want one row sess_a", page1.Items)
+	}
+	if page1.NextCursor == "" {
+		t.Fatal("page 1: NextCursor required (more rows remain)")
+	}
+	w2 := do(t, h, "/sessions?sort=cost_total&direction=desc&limit=1&cursor="+page1.NextCursor)
+	var page2 SessionListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if len(page2.Items) != 1 || page2.Items[0].ID != "sess_b" {
+		t.Fatalf("page 2 = %+v, want one row sess_b", page2.Items)
+	}
+	if page2.NextCursor != "" {
+		t.Errorf("page 2: NextCursor = %q, want empty (last page)", page2.NextCursor)
+	}
+}
+
+func TestListSessions_SortCursorWalk_AscAggregate(t *testing.T) {
+	// ASC direction also pages — checks the `>` arm of keysetCmp.
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?sort=tokens_in_total&direction=asc&limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if page1.Items[0].ID != "sess_b" {
+		t.Fatalf("page 1 = %q, want sess_b (smallest tokens_in first)", page1.Items[0].ID)
+	}
+	w2 := do(t, h, "/sessions?sort=tokens_in_total&direction=asc&limit=1&cursor="+page1.NextCursor)
+	var page2 SessionListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if page2.Items[0].ID != "sess_a" {
+		t.Fatalf("page 2 = %q, want sess_a", page2.Items[0].ID)
+	}
+}
+
+func TestListSessions_SortCursorMismatch(t *testing.T) {
+	// Mint a cursor under cost_total, replay it under created_at —
+	// must 400 cleanly rather than walking a meaningless keyset.
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?sort=cost_total&direction=desc&limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if page1.NextCursor == "" {
+		t.Fatal("setup: no cursor minted")
+	}
+	w2 := do(t, h, "/sessions?sort=created_at&direction=desc&limit=1&cursor="+page1.NextCursor)
+	if w2.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (cursor sort mismatch); body=%s", w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), "cursor") {
+		t.Errorf("error body missing 'cursor' for debugging: %s", w2.Body.String())
+	}
+}
+
+func TestListSessions_SortInvalidKey(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?sort=session_id")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (unsupported sort key)", w.Code)
+	}
+}
+
+func TestListSessions_DirectionInvalid(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?direction=sideways")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (unsupported direction)", w.Code)
+	}
+}
+
+// TestListSessions_LegacyTwoFieldCursor verifies the back-compat decode path:
+// a cursor minted before the sort extension was introduced (just `ts|id`)
+// must still walk under the default sort so in-flight cursors survive a
+// deploy.
+func TestListSessions_LegacyTwoFieldCursor(t *testing.T) {
+	// Hand-craft the legacy form: sess_b's created_at | sess_b. Walking
+	// under the default sort (created_at DESC) from this anchor should
+	// land on sess_a (the row strictly less than sess_b's timestamp).
+	legacyRaw := "2024-02-01T10:00:00Z|sess_b"
+	legacy := base64.RawURLEncoding.EncodeToString([]byte(legacyRaw))
+	w := do(t, newTestHandler(t), "/sessions?cursor="+legacy)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].ID != "sess_a" {
+		t.Errorf("legacy cursor walk = %+v, want [sess_a]", resp.Items)
+	}
+}
+
+// TestListSessions_SortCursorWalk_LLMCallCount + _ToolCallCount fill the
+// matrix gap: the cost_total and tokens_in_total walks already exercise
+// the HAVING branch, but the per-event-type COUNT-CASE sort expressions
+// (sortKeyLLMCallCount / sortKeyToolCallCount) build a different SQL
+// shape and merit their own walks.
+func TestListSessions_SortCursorWalk_LLMCallCount(t *testing.T) {
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?sort=llm_call_count&direction=desc&limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if len(page1.Items) != 1 || page1.Items[0].ID != "sess_a" {
+		t.Fatalf("page 1 = %+v, want sess_a (2 llm_responses)", page1.Items)
+	}
+	if page1.NextCursor == "" {
+		t.Fatal("page 1: NextCursor required")
+	}
+	w2 := do(t, h, "/sessions?sort=llm_call_count&direction=desc&limit=1&cursor="+page1.NextCursor)
+	var page2 SessionListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if len(page2.Items) != 1 || page2.Items[0].ID != "sess_b" {
+		t.Fatalf("page 2 = %+v, want sess_b", page2.Items)
+	}
+}
+
+func TestListSessions_SortCursorWalk_ToolCallCount(t *testing.T) {
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?sort=tool_call_count&direction=desc&limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if len(page1.Items) != 1 || page1.Items[0].ID != "sess_b" {
+		t.Fatalf("page 1 = %+v, want sess_b (1 tool_call_result)", page1.Items)
+	}
+	w2 := do(t, h, "/sessions?sort=tool_call_count&direction=desc&limit=1&cursor="+page1.NextCursor)
+	var page2 SessionListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if len(page2.Items) != 1 || page2.Items[0].ID != "sess_a" {
+		t.Fatalf("page 2 = %+v, want sess_a (0 tool_call_results)", page2.Items)
+	}
+}
+
+// TestListSessions_SortWithFilter confirms filters still narrow under a
+// non-default sort — without that guarantee the cost-by-tenant analytics
+// query would silently drop the entity scope.
+func TestListSessions_SortWithFilter(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?sort=cost_total&direction=desc&entity_id=user_1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].ID != "sess_a" {
+		t.Errorf("Items = %+v, want only sess_a (entity_id filter under cost_total sort)", resp.Items)
+	}
+	// Totals must also reflect the filter — the user_1-scoped tile would
+	// otherwise show the global cost.
+	if resp.Totals.SessionCount != 1 {
+		t.Errorf("Totals.SessionCount = %d, want 1", resp.Totals.SessionCount)
+	}
+}
+
+// TestListSessions_LegacyCursorRejectedUnderNonDefaultSort pins the
+// validation: a pre-#8 cursor (defaultSessionSort embedded) replayed
+// against a non-default sort returns 400 cursor sort mismatch instead of
+// silently walking a meaningless keyset under the new sort's space.
+func TestListSessions_LegacyCursorRejectedUnderNonDefaultSort(t *testing.T) {
+	legacyRaw := "2024-02-01T10:00:00Z|sess_b"
+	legacy := base64.RawURLEncoding.EncodeToString([]byte(legacyRaw))
+	w := do(t, newTestHandler(t), "/sessions?sort=cost_total&direction=desc&cursor="+legacy)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (legacy cursor mismatch); body = %s", w.Code, w.Body.String())
 	}
 }
 
