@@ -20,13 +20,22 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 
 `/sessions`, `/events`, and `/events/stats` accept the same shared filter set:
 
-- `entity_id` — opentalon entity (in Timly terms: the **user**)
+- `entity_id` — opentalon entity (in Timly terms: the **user**); singular
+  form, kept for backward compat. Used alone, it scopes to the same row
+  set as `include_entity_ids=<id>`; when both are set the two predicates
+  AND together.
 - `group_id` — opentalon group (in Timly terms: the **entity**)
+- `include_entity_ids` — comma-separated list of entity_ids to scope rows
+  **and** aggregation to. Use it for multi-actor scope (e.g. a support
+  engineer reviewing sessions across a handful of related users) instead
+  of N round-trips with `entity_id`. ANDs with the singular `entity_id`
+  if both are set. Empty value and unknown ids are no-ops; capped at 200.
 - `exclude_entity_ids` — comma-separated list of entity_ids to exclude
   from rows **and** aggregation. Use it to keep list, totals, and
   `/events/stats` numbers in lockstep when hiding a subset of actors
   (e.g. support staff who shouldn't count against a tenant's cost view).
-  Empty value and unknown ids are no-ops.
+  Empty value and unknown ids are no-ops; capped at 200. ANDs with
+  `include_entity_ids` if both are set.
 - `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive
 - `limit` — page size, default 25, capped at 200
 
