@@ -2041,3 +2041,168 @@ func itemIDs(items []SessionListItem) []string {
 	}
 	return out
 }
+
+// --- Validation strictness (cleanup follow-up to PR #12) ---
+
+// include_payload accepts only literal "true"/"false"; anything else 400.
+// Locks the contract that silent fallback (pre-cleanup behavior) is gone.
+func TestListEvents_IncludePayloadValidation(t *testing.T) {
+	h := newTestHandler(t)
+
+	for _, target := range []string{
+		"/events?include_payload=true",
+		"/events?include_payload=false",
+		"/events", // empty → default true
+	} {
+		if w := do(t, h, target); w.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200; body = %s", target, w.Code, w.Body.String())
+		}
+	}
+
+	for _, target := range []string{
+		"/events?include_payload=banana",
+		"/events?include_payload=1",
+		"/events?include_payload=TRUE",
+		"/events?include_payload=yes",
+	} {
+		w := do(t, h, target)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body = %s", target, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "include_payload") {
+			t.Errorf("%s: error body should name include_payload, got %s", target, w.Body.String())
+		}
+	}
+}
+
+// limit: garbage → 400, over-cap → silent clamp (option B from the audit).
+// Locks the chosen middle path: be strict about consumer mistakes
+// (banana, negative, zero) but tolerant of "give me everything" intent.
+func TestLimitValidation_StrictGarbageTolerantOverCap(t *testing.T) {
+	h := newBucketHandler(t)
+
+	// Garbage / non-positive → 400 on every endpoint that uses limitFromQuery.
+	for _, target := range []string{
+		"/sessions?limit=banana",
+		"/sessions?limit=0",
+		"/sessions?limit=-5",
+		"/events?limit=banana",
+		"/events?limit=0",
+	} {
+		w := do(t, h, target)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body = %s", target, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "limit") {
+			t.Errorf("%s: error body should name limit, got %s", target, w.Body.String())
+		}
+	}
+
+	// Over-cap → clamps to maxLimit (200), still 200 OK.
+	w := do(t, h, "/sessions?limit=999999")
+	if w.Code != http.StatusOK {
+		t.Fatalf("/sessions?limit=999999: status = %d, want 200 (clamped); body = %s", w.Code, w.Body.String())
+	}
+	// We can't easily assert exactly 200 items returned (fixture is small),
+	// but the response must be valid JSON with items present.
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+}
+
+// --- event_type filter on /events/stats (cleanup follow-up to PR #12) ---
+
+// event_type filter narrows totals to a single event type. Sub-counters
+// for the other types zero out; session_count drops to "sessions with
+// at least one event of this type".
+func TestEventsStats_EventTypeFilter_NarrowsTotals(t *testing.T) {
+	h := newBucketHandler(t)
+
+	// All LLM events in May 2026: alice(2) + bob(1) + carol(1) = 4 events.
+	w := do(t, h, "/events/stats?event_type=llm_response&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if stats.EventCount != 4 {
+		t.Errorf("EventCount = %d, want 4 (llm_response only)", stats.EventCount)
+	}
+	if stats.LLMCallCount != 4 {
+		t.Errorf("LLMCallCount = %d, want 4", stats.LLMCallCount)
+	}
+	if stats.ToolCallCount != 0 {
+		t.Errorf("ToolCallCount = %d, want 0 (filtered out)", stats.ToolCallCount)
+	}
+	if stats.SessionCount != 3 {
+		t.Errorf("SessionCount = %d, want 3 (alice, bob, carol all have at least one llm_response)", stats.SessionCount)
+	}
+
+	// Only tool_call_result events: just bob has one in May.
+	w = do(t, h, "/events/stats?event_type=tool_call_result&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if stats.EventCount != 1 || stats.ToolCallCount != 1 || stats.LLMCallCount != 0 {
+		t.Errorf("tool_call_result totals = %+v, want EventCount=1 ToolCallCount=1 LLMCallCount=0", stats)
+	}
+	if stats.TokensInTotal != 0 || stats.CostInputTotal != 0 {
+		t.Errorf("tool_call_result tokens/cost should be 0 (no llm payload), got tokens=%d cost=%g",
+			stats.TokensInTotal, stats.CostInputTotal)
+	}
+}
+
+// event_type filter applies to time_buckets too: window+filter narrows
+// per-bucket counters to only that event type.
+func TestEventsStats_EventTypeFilter_AppliesToBuckets(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?event_type=tool_call_result&bucket_by=day&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	byKey := bucketByKey(stats.TimeBuckets)
+
+	// Bob's tool_call_result on 2026-05-14 is the only event.
+	if b := byKey["2026-05-14"]; b.EventCount != 1 || b.ToolCallCount != 1 {
+		t.Errorf("2026-05-14 = %+v, want EventCount=1 ToolCallCount=1", b)
+	}
+	// All other days zero (alice/carol's llm_response events are filtered out).
+	for _, key := range []string{"2026-05-10", "2026-05-12", "2026-05-16"} {
+		if b := byKey[key]; b.EventCount != 0 {
+			t.Errorf("%s = %+v, want EventCount=0 (no tool_call_result)", key, b)
+		}
+	}
+}
+
+// event_type + group_by=event_type → 400 (redundant: grouping collapses
+// to one bucket). Locks the validation that prevents the silly call.
+func TestEventsStats_EventTypeFilter_RejectedWithGroupBy(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?event_type=llm_response&group_by=event_type")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "event_type") || !strings.Contains(w.Body.String(), "group_by") {
+		t.Errorf("body should mention event_type + group_by conflict, got %s", w.Body.String())
+	}
+}
+
+// event_type + bucket_by is allowed (useful: time-series for one type).
+// Covered by the AppliesToBuckets test above, but explicit smoke here.
+func TestEventsStats_EventTypeFilter_BucketByCombineAllowed(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?event_type=llm_response&bucket_by=month&since=2026-05-01T00:00:00Z&until=2026-07-01T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// Empty filter (?event_type=) is treated as absent — same shape as no param.
+func TestEventsStats_EventTypeFilter_EmptyIsAbsent(t *testing.T) {
+	h := newBucketHandler(t)
+	w1 := do(t, h, "/events/stats?since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	w2 := do(t, h, "/events/stats?event_type=&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	if w1.Body.String() != w2.Body.String() {
+		t.Errorf("?event_type= should equal no param:\n  no param: %s\n  empty:    %s",
+			w1.Body.String(), w2.Body.String())
+	}
+}

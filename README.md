@@ -13,7 +13,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 | GET | `/sessions` | Paginated session list, each row with its own JIT-aggregated `stats`, plus `totals` over the full filtered set |
 | GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats` |
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
-| GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions`, optional `group_by=event_type` + `sample_sessions=N`, optional `bucket_by=day/week/month/year` for time-series |
+| GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions` plus optional `event_type` exact-match, optional `group_by=event_type` + `sample_sessions=N`, optional `bucket_by=day/week/month/year` for time-series |
 | GET | `/prompt-snapshots?sha=...` | Resolve a prompt body by sha256 (referenced from `turn_start` events) |
 
 ### Filters
@@ -37,13 +37,17 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
   Empty value and unknown ids are no-ops; capped at 200. ANDs with
   `include_entity_ids` if both are set.
 - `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive. **Filter on event timestamp uniformly across all endpoints**: a session with `created_at` before the window but events inside is included; a session with `created_at` inside the window but events outside is not. Containers vs activity — the API tracks activity.
-- `limit` — page size, default 25, capped at 200
+- `limit` — page size, default 25, capped at 200. Non-numeric values or ≤ 0 → 400 (almost always a consumer mistake). Values above the cap silently clamp to 200 — "give me everything" is a legitimate intent and the cursor lets the consumer page through.
 
 `/events` adds:
 
 - `session_id` — restrict to one session
 - `event_type` — exact match (e.g. `llm_response`, `tool_call_result`)
-- `include_payload=false` — omit payloads (smaller responses, no JOIN cost change)
+- `include_payload=false` — omit payloads (smaller responses, no JOIN cost change). Accepts literal `true` / `false` only; any other value (`banana`, `1`, `TRUE`, …) → 400.
+
+`/events/stats` adds:
+
+- `event_type` — exact match, narrows totals and time buckets to a single event type. Sub-counters for the other types zero out (e.g. `event_type=tool_call_result` → `llm_call_count=0`, `tokens_*=0`). Mutually exclusive with `group_by=event_type` (the grouping would collapse to one bucket — 400 instead).
 
 ### Sort (`/sessions`)
 

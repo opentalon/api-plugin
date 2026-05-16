@@ -355,15 +355,42 @@ const (
 )
 
 // limitFromQuery reads ?limit= with defaults + cap.
-func limitFromQuery(r *http.Request) int {
-	v, err := strconv.Atoi(r.URL.Query().Get("limit"))
-	switch {
-	case err != nil || v <= 0:
-		return defaultLimit
-	case v > maxLimit:
-		return maxLimit
+//
+// Empty value → defaultLimit. Garbage ("banana") or ≤ 0 → 400, since
+// that's almost certainly a consumer mistake the silent-default would
+// hide. A value above maxLimit clamps rather than rejects — "I wanted
+// everything" is a legitimate intent and a 200-row response + cursor is
+// the helpful answer.
+func limitFromQuery(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return defaultLimit, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("limit: must be a positive integer, got %q", raw)
+	}
+	if v > maxLimit {
+		return maxLimit, nil
+	}
+	return v, nil
+}
+
+// boolFromQuery reads an optional bool query param ("true"/"false"
+// case-sensitive). Empty returns def. Anything else is 400 — silent
+// fallback would let `?include_payload=banana` pass as the default,
+// hiding a consumer typo.
+func boolFromQuery(r *http.Request, key string, def bool) (bool, error) {
+	raw := r.URL.Query().Get(key)
+	switch raw {
+	case "":
+		return def, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
 	default:
-		return v
+		return false, fmt.Errorf("%s: must be \"true\" or \"false\", got %q", key, raw)
 	}
 }
 
@@ -756,7 +783,11 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	limit := limitFromQuery(r)
+	limit, err := limitFromQuery(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	items, next, err := listSessions(h.db, h.dialect, f, sort, cur, limit)
 	if err != nil {
@@ -800,8 +831,16 @@ func (h *Handler) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	limit := limitFromQuery(r)
-	includePayload := r.URL.Query().Get("include_payload") != "false"
+	limit, err := limitFromQuery(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	includePayload, err := boolFromQuery(r, "include_payload", true)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	q := r.URL.Query()
 	items, next, err := listEvents(h.db, h.dialect, eventListFilters{
@@ -850,6 +889,16 @@ func eventsStatsOptsFromQuery(r *http.Request) (eventsStatsOpts, error) {
 			return eventsStatsOpts{}, fmt.Errorf("group_by: only 'event_type' is supported")
 		}
 		opts.GroupByEventType = true
+	}
+	if et := q.Get("event_type"); et != "" {
+		// event_type narrows the row set to a single type. Combined with
+		// group_by=event_type the breakdown collapses to one bucket —
+		// reject as redundant so the consumer notices instead of getting
+		// a one-element by_event_type back.
+		if opts.GroupByEventType {
+			return eventsStatsOpts{}, fmt.Errorf("event_type and group_by=event_type are mutually exclusive (the grouping collapses to one bucket)")
+		}
+		opts.EventType = et
 	}
 	if ss := q.Get("sample_sessions"); ss != "" {
 		// sample_sessions is meaningless without a grouping dimension —
@@ -989,6 +1038,18 @@ func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
 		q.WriteString(" AND se.ts < ?")
 		*args = append(*args, f.Until)
 	}
+}
+
+// applyEventTypeFilter appends an optional event_type predicate. Lives
+// outside applySessionFilters because event_type is not a session-level
+// filter — only /events and /events/stats use it, /sessions does not
+// (a session isn't of "one type", it contains events of many types).
+func applyEventTypeFilter(q *strings.Builder, args *[]any, eventType string) {
+	if eventType == "" {
+		return
+	}
+	q.WriteString(" AND se.event_type = ?")
+	*args = append(*args, eventType)
 }
 
 func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur sessionCursor, limit int) ([]SessionListItem, sessionCursor, error) {
@@ -1309,6 +1370,7 @@ type eventsStatsOpts struct {
 	GroupByEventType bool
 	SampleSessions   int    // 0 = omit sample_session_ids; 1..maxSampleSessions otherwise
 	BucketBy         string // "" | "day" | "week" | "month" | "year"
+	EventType        string // "" = all event types; "llm_response" / "tool_call_result" / ... = restrict
 }
 
 // eventsStats is the orchestrator. Three response shapes:
@@ -1324,7 +1386,7 @@ type eventsStatsOpts struct {
 // pushes us to the portable per-query path. Each query is over the same
 // indexed JOIN, so the round-trip cost stays modest.
 func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error) {
-	stats, err := eventsStatsTotals(db, d, opts.Filters)
+	stats, err := eventsStatsTotals(db, d, opts.Filters, opts.EventType)
 	if err != nil {
 		return EventStats{}, err
 	}
@@ -1334,7 +1396,7 @@ func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error
 		// top-level counter for every counter except session_count
 		// (where multi-bucket sessions intentionally double-count, see
 		// TimeBucket godoc).
-		sparse, err := eventsStatsTimeBuckets(db, d, opts.Filters, opts.BucketBy)
+		sparse, err := eventsStatsTimeBuckets(db, d, opts.Filters, opts.BucketBy, opts.EventType)
 		if err != nil {
 			return EventStats{}, err
 		}
@@ -1368,7 +1430,13 @@ func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error
 // session_events so applySessionFilters' se.ts predicate works — when
 // no time filter is set the LEFT JOIN keeps sessions-without-events in
 // the count too.
-func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, error) {
+//
+// eventType (optional) restricts to a single event_type — narrows
+// event_count to that type, and zeroes the llm/tool sub-counters if
+// they don't match (e.g. event_type=tool_call_result → llm_call_count
+// = 0, tokens_* = 0). session_count counts distinct sessions that have
+// at least one event of the requested type in the window.
+func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters, eventType string) (EventStats, error) {
 	var q strings.Builder
 	q.WriteString(`SELECT
 		COUNT(DISTINCT s.id) AS session_count,
@@ -1383,6 +1451,7 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, err
 
 	var args []any
 	applySessionFilters(&q, &args, f)
+	applyEventTypeFilter(&q, &args, eventType)
 
 	var stats EventStats
 	row := db.QueryRow(d.Rebind(q.String()), args...)
@@ -1405,7 +1474,7 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, err
 // runs it through fillEmptyBuckets to produce a continuous x-axis.
 // Ordering is ASC by bucket so the fill loop can do a single sorted
 // merge instead of building a full lookup map.
-func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity string) ([]TimeBucket, error) {
+func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity, eventType string) ([]TimeBucket, error) {
 	bucketExpr := d.DateBucket("se.ts", granularity)
 
 	var q strings.Builder
@@ -1429,6 +1498,7 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 
 	var args []any
 	applySessionFilters(&q, &args, f)
+	applyEventTypeFilter(&q, &args, eventType)
 
 	// GROUP BY the same expression we project, ORDER BY the bucket
 	// alias. SQLite accepts both forms; Postgres requires the alias or
