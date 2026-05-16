@@ -69,6 +69,40 @@ func (d Dialect) JSONFloat(column, fieldName string) string {
 	return fmt.Sprintf(`COALESCE(CAST(json_extract(%s,'$.%s') AS REAL), 0)`, column, fieldName)
 }
 
+// DateBucket returns a dialect-specific SQL fragment that truncates an
+// RFC3339 timestamp TEXT column to a UTC-anchored bucket-start date,
+// formatted as YYYY-MM-DD text. Used by /events/stats?bucket_by=… to
+// group events into day / week / month / year buckets in a portable way.
+//
+// granularity MUST be one of "day", "week", "month", "year" — validated
+// upstream in eventsStatsOptsFromQuery so the value can be interpolated
+// safely (it is never user-controlled past validation).
+//
+// Bucket-key semantics:
+//   - day   → that day's date
+//   - week  → Monday of that week (ISO 8601, aligned with PG date_trunc)
+//   - month → first of that month
+//   - year  → January 1 of that year
+func (d Dialect) DateBucket(column, granularity string) string {
+	if d.name == "postgres" {
+		return fmt.Sprintf(`to_char(date_trunc('%s', %s::timestamptz AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`,
+			granularity, column)
+	}
+	switch granularity {
+	case "day":
+		return fmt.Sprintf("date(%s)", column)
+	case "week":
+		// 'weekday 0' = next Sunday (or same day if already Sunday);
+		// '-6 days' then yields the ISO-Monday of that week.
+		return fmt.Sprintf("date(%s, 'weekday 0', '-6 days')", column)
+	case "month":
+		return fmt.Sprintf("date(%s, 'start of month')", column)
+	case "year":
+		return fmt.Sprintf("date(%s, 'start of year')", column)
+	}
+	return ""
+}
+
 // OpenDB opens a read-only database connection.
 func OpenDB(driver, dsn string) (*sql.DB, Dialect, error) {
 	switch driver {
