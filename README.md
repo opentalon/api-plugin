@@ -43,7 +43,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 - `sort` (default `created_at`) — one of: `created_at`, `cost_total`, `llm_call_count`, `tool_call_count`, `tokens_in_total`, `tokens_out_total`. `cost_total` is `cost_input_total + cost_output_total`.
 - `direction` (default `desc`) — `asc` or `desc`.
 
-The cursor encodes the active sort identifier; replaying a cursor under a different `sort`/`direction` returns 400 ("cursor sort mismatch") rather than walking a meaningless keyset. Legacy two-field cursors minted before this feature are accepted under the default sort for back-compat.
+The cursor format extends to four fields — `<sort>|<direction>|<value>|<id>`, base64url-encoded — so the active sort identifier travels with the boundary. Replaying a cursor under a different `sort`/`direction` returns 400 ("cursor sort mismatch") rather than walking a meaningless keyset. Legacy two-field cursors (`<value>|<id>`) minted before this feature are accepted under the default sort for back-compat.
 
 ### Pagination
 

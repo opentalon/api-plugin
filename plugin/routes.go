@@ -322,7 +322,11 @@ func decodeSessionCursor(s string) (sessionCursor, error) {
 	if err != nil {
 		return sessionCursor{}, fmt.Errorf("cursor: invalid encoding")
 	}
-	parts := strings.Split(string(raw), "|")
+	// SplitN cap is 4 so a session ID that happens to contain "|" still
+	// round-trips cleanly — the trailing piece absorbs the remainder rather
+	// than getting rejected as malformed. Mirrors the SplitN(",",2) the
+	// legacy /events decoder uses on cursorPair for the same reason.
+	parts := strings.SplitN(string(raw), "|", 4)
 	switch len(parts) {
 	case 2:
 		// Pre-sort cursor: created_at DESC implicit.

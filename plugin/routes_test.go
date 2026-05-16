@@ -411,6 +411,79 @@ func TestListSessions_LegacyTwoFieldCursor(t *testing.T) {
 	}
 }
 
+// TestListSessions_SortCursorWalk_LLMCallCount + _ToolCallCount fill the
+// matrix gap: the cost_total and tokens_in_total walks already exercise
+// the HAVING branch, but the per-event-type COUNT-CASE sort expressions
+// (sortKeyLLMCallCount / sortKeyToolCallCount) build a different SQL
+// shape and merit their own walks.
+func TestListSessions_SortCursorWalk_LLMCallCount(t *testing.T) {
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?sort=llm_call_count&direction=desc&limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if len(page1.Items) != 1 || page1.Items[0].ID != "sess_a" {
+		t.Fatalf("page 1 = %+v, want sess_a (2 llm_responses)", page1.Items)
+	}
+	if page1.NextCursor == "" {
+		t.Fatal("page 1: NextCursor required")
+	}
+	w2 := do(t, h, "/sessions?sort=llm_call_count&direction=desc&limit=1&cursor="+page1.NextCursor)
+	var page2 SessionListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if len(page2.Items) != 1 || page2.Items[0].ID != "sess_b" {
+		t.Fatalf("page 2 = %+v, want sess_b", page2.Items)
+	}
+}
+
+func TestListSessions_SortCursorWalk_ToolCallCount(t *testing.T) {
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions?sort=tool_call_count&direction=desc&limit=1")
+	var page1 SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &page1)
+	if len(page1.Items) != 1 || page1.Items[0].ID != "sess_b" {
+		t.Fatalf("page 1 = %+v, want sess_b (1 tool_call_result)", page1.Items)
+	}
+	w2 := do(t, h, "/sessions?sort=tool_call_count&direction=desc&limit=1&cursor="+page1.NextCursor)
+	var page2 SessionListResponse
+	mustUnmarshal(t, w2.Body.Bytes(), &page2)
+	if len(page2.Items) != 1 || page2.Items[0].ID != "sess_a" {
+		t.Fatalf("page 2 = %+v, want sess_a (0 tool_call_results)", page2.Items)
+	}
+}
+
+// TestListSessions_SortWithFilter confirms filters still narrow under a
+// non-default sort — without that guarantee the cost-by-tenant analytics
+// query would silently drop the entity scope.
+func TestListSessions_SortWithFilter(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?sort=cost_total&direction=desc&entity_id=user_1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].ID != "sess_a" {
+		t.Errorf("Items = %+v, want only sess_a (entity_id filter under cost_total sort)", resp.Items)
+	}
+	// Totals must also reflect the filter — the user_1-scoped tile would
+	// otherwise show the global cost.
+	if resp.Totals.SessionCount != 1 {
+		t.Errorf("Totals.SessionCount = %d, want 1", resp.Totals.SessionCount)
+	}
+}
+
+// TestListSessions_LegacyCursorRejectedUnderNonDefaultSort pins the
+// validation: a pre-#8 cursor (defaultSessionSort embedded) replayed
+// against a non-default sort returns 400 cursor sort mismatch instead of
+// silently walking a meaningless keyset under the new sort's space.
+func TestListSessions_LegacyCursorRejectedUnderNonDefaultSort(t *testing.T) {
+	legacyRaw := "2024-02-01T10:00:00Z|sess_b"
+	legacy := base64.RawURLEncoding.EncodeToString([]byte(legacyRaw))
+	w := do(t, newTestHandler(t), "/sessions?sort=cost_total&direction=desc&cursor="+legacy)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (legacy cursor mismatch); body = %s", w.Code, w.Body.String())
+	}
+}
+
 // TestListSessions_EmptyFilterMatch is the zero-row contract: filter
 // that matches nothing returns Items=[] and Totals zeroed out. The
 // upstream guarantees this via COALESCE(..., 0) on every SUM/COUNT;
