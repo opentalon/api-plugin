@@ -36,7 +36,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
   (e.g. support staff who shouldn't count against a tenant's cost view).
   Empty value and unknown ids are no-ops; capped at 200. ANDs with
   `include_entity_ids` if both are set.
-- `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive
+- `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive. **Filter on event timestamp uniformly across all endpoints**: a session with `created_at` before the window but events inside is included; a session with `created_at` inside the window but events outside is not. Containers vs activity — the API tracks activity.
 - `limit` — page size, default 25, capped at 200
 
 `/events` adds:
@@ -161,7 +161,7 @@ Exceeding the cap returns 400.
 
 **Sum-consistency.** For every counter except `session_count`, Σ(`time_buckets[].counter`) == top-level counter. The exception is by design: a session active in more than one bucket period contributes 1 to each bucket's `session_count` but is counted once at top level (distinct sessions). Long-running sessions therefore make Σ(buckets) ≥ top-level for that one field — without it, the per-bucket session count would mis-represent "who was active this day".
 
-**Filter axis under `bucket_by`.** When `bucket_by` is set, `since` / `until` apply to the event timestamp (`session_events.ts`) rather than the session creation time (`sessions.created_at`) used elsewhere. This is what makes Σ(buckets) match top-level for the bucket query path. A session created on the day before `since` but with events inside the window contributes to both totals and buckets.
+**Filter axis.** `since` / `until` always apply to the event timestamp (`session_events.ts`) — see the shared filters block above. This is the same axis used by `/sessions` rows, `/events` rows, `/events/stats` totals, and `/events/stats` time buckets, so Σ(buckets) matches top-level and the same window selects the same row set everywhere.
 
 **Performance hint.** Scope queries with `entity_id`, `include_entity_ids`, or `group_id` for fastest response. Unscoped windows (admin-only "all tenants, multi-year") scan the full event stream — they work but are noticeably slower; the indexing improvement that closes this gap lives in opentalon-core.
 

@@ -948,24 +948,23 @@ func sessionStatsSelect(d Dialect) string {
 	}, ", ")
 }
 
-// applySessionFilters appends shared filter predicates and args, with
-// since/until applied to s.created_at (the default for /sessions and
-// the non-bucket /events/stats path). Wrapper around
-// applySessionFiltersOn — kept as the convenience entry point so
-// existing callers don't have to repeat the time-column choice.
+// applySessionFilters appends shared filter predicates and args. The
+// sessions table is always aliased "s", session_events always "se".
+//
+// since/until apply to se.ts (event timestamp), uniform across every
+// endpoint that uses this builder. Rationale: "in this time window"
+// universally means "events that occurred in the window", not "sessions
+// created in the window" — sessions are containers, events are the
+// economically-meaningful data points. A session created before the
+// window with events inside contributes; a session created inside with
+// no events does not. Also makes Σ(time_buckets[].counter) == top-level
+// counter hold for every counter on /events/stats without conditional
+// time-column gymnastics.
+//
+// The session_events JOIN must be present in the query whenever this
+// helper is called with a non-empty Since/Until (or any other se.* /
+// payload-based predicate). All current callers JOIN.
 func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
-	applySessionFiltersOn(q, args, f, "s.created_at")
-}
-
-// applySessionFiltersOn is applySessionFilters with explicit choice of
-// the column the since/until predicates apply to. The /events/stats
-// bucket_by path passes "se.ts" so bucket counters stay sum-consistent
-// with top-level totals when one filter axis is the event timestamp
-// rather than the session-create timestamp (a long-running session
-// would otherwise have events landing inside a bucket that fall outside
-// the [since,until) window the user authored). The sessions table is
-// always aliased "s", session_events always "se".
-func applySessionFiltersOn(q *strings.Builder, args *[]any, f sessionFilters, timeCol string) {
 	if f.EntityID != "" {
 		q.WriteString(" AND s.entity_id = ?")
 		*args = append(*args, f.EntityID)
@@ -983,11 +982,11 @@ func applySessionFiltersOn(q *strings.Builder, args *[]any, f sessionFilters, ti
 	writeInClause(q, args, "s.entity_id", f.IncludeEntityIDs, false)
 	writeInClause(q, args, "s.entity_id", f.ExcludeEntityIDs, true)
 	if f.Since != "" {
-		fmt.Fprintf(q, " AND %s >= ?", timeCol)
+		q.WriteString(" AND se.ts >= ?")
 		*args = append(*args, f.Since)
 	}
 	if f.Until != "" {
-		fmt.Fprintf(q, " AND %s < ?", timeCol)
+		q.WriteString(" AND se.ts < ?")
 		*args = append(*args, f.Until)
 	}
 }
@@ -1239,25 +1238,24 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 		q.WriteString(` AND se.event_type = ?`)
 		args = append(args, f.EventType)
 	}
-	if f.Filters.Since != "" {
-		q.WriteString(` AND se.ts >= ?`)
-		args = append(args, f.Filters.Since)
-	}
-	if f.Filters.Until != "" {
-		q.WriteString(` AND se.ts < ?`)
-		args = append(args, f.Filters.Until)
-	}
 	if needJoin {
-		if f.Filters.EntityID != "" {
-			q.WriteString(` AND s.entity_id = ?`)
-			args = append(args, f.Filters.EntityID)
+		// Full shared filter builder — JOIN is present so entity/group
+		// predicates on the `s` alias are valid, and since/until on
+		// se.ts is the same axis the no-join branch uses below.
+		applySessionFilters(&q, &args, f.Filters)
+	} else {
+		// No JOIN path: entity/group filters are absent by construction
+		// (that's what gates needJoin). Only since/until remain to apply,
+		// and they live on se.ts uniformly — same axis applySessionFilters
+		// would have used.
+		if f.Filters.Since != "" {
+			q.WriteString(` AND se.ts >= ?`)
+			args = append(args, f.Filters.Since)
 		}
-		if f.Filters.GroupID != "" {
-			q.WriteString(` AND s.group_id = ?`)
-			args = append(args, f.Filters.GroupID)
+		if f.Filters.Until != "" {
+			q.WriteString(` AND se.ts < ?`)
+			args = append(args, f.Filters.Until)
 		}
-		writeInClause(&q, &args, "s.entity_id", f.Filters.IncludeEntityIDs, false)
-		writeInClause(&q, &args, "s.entity_id", f.Filters.ExcludeEntityIDs, true)
 	}
 	if cur.TS != "" {
 		q.WriteString(` AND (se.ts < ? OR (se.ts = ? AND se.id < ?))`)
@@ -1326,26 +1324,22 @@ type eventsStatsOpts struct {
 // pushes us to the portable per-query path. Each query is over the same
 // indexed JOIN, so the round-trip cost stays modest.
 func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error) {
+	stats, err := eventsStatsTotals(db, d, opts.Filters)
+	if err != nil {
+		return EventStats{}, err
+	}
 	if opts.BucketBy != "" {
-		// Bucket path: totals + buckets both filter on se.ts so the
-		// invariant Σ(time_buckets[].counter) == top-level counter
-		// holds for every counter except session_count (see TimeBucket
-		// godoc for why distinct-session-per-bucket is intentional).
-		stats, err := eventsStatsTotalsOn(db, d, opts.Filters, "se.ts")
-		if err != nil {
-			return EventStats{}, err
-		}
+		// applySessionFilters filters on se.ts uniformly, so totals and
+		// buckets see the same row set — Σ(time_buckets[].counter) ==
+		// top-level counter for every counter except session_count
+		// (where multi-bucket sessions intentionally double-count, see
+		// TimeBucket godoc).
 		sparse, err := eventsStatsTimeBuckets(db, d, opts.Filters, opts.BucketBy)
 		if err != nil {
 			return EventStats{}, err
 		}
 		stats.TimeBuckets = fillEmptyBuckets(sparse, opts.Filters.Since, opts.Filters.Until, opts.BucketBy)
 		return stats, nil
-	}
-
-	stats, err := eventsStatsTotals(db, d, opts.Filters)
-	if err != nil {
-		return EventStats{}, err
 	}
 	if !opts.GroupByEventType {
 		return stats, nil
@@ -1369,18 +1363,12 @@ func eventsStats(db *sql.DB, d Dialect, opts eventsStatsOpts) (EventStats, error
 	return stats, nil
 }
 
+// eventsStatsTotals is the cross-session aggregate. Same JIT pattern as
+// sessionTotals but without the per-session GROUP BY. Always JOINs
+// session_events so applySessionFilters' se.ts predicate works — when
+// no time filter is set the LEFT JOIN keeps sessions-without-events in
+// the count too.
 func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters) (EventStats, error) {
-	return eventsStatsTotalsOn(db, d, f, "s.created_at")
-}
-
-// eventsStatsTotalsOn is the totals query with a parametrised time
-// column for since/until. Default path (s.created_at) goes through
-// eventsStatsTotals; the bucket_by path calls in directly with se.ts.
-func eventsStatsTotalsOn(db *sql.DB, d Dialect, f sessionFilters, timeCol string) (EventStats, error) {
-	// Cross-session aggregate; same JIT pattern as sessionTotals but
-	// without the per-session GROUP BY. Always JOINs sessions so
-	// entity/group filters work — when neither is set the JOIN is still
-	// cheap (PK side).
 	var q strings.Builder
 	q.WriteString(`SELECT
 		COUNT(DISTINCT s.id) AS session_count,
@@ -1394,7 +1382,7 @@ func eventsStatsTotalsOn(db *sql.DB, d Dialect, f sessionFilters, timeCol string
 		FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
 
 	var args []any
-	applySessionFiltersOn(&q, &args, f, timeCol)
+	applySessionFilters(&q, &args, f)
 
 	var stats EventStats
 	row := db.QueryRow(d.Rebind(q.String()), args...)
@@ -1408,10 +1396,10 @@ func eventsStatsTotalsOn(db *sql.DB, d Dialect, f sessionFilters, timeCol string
 }
 
 // eventsStatsTimeBuckets returns one row per bucket-start key in the
-// filtered window that has at least one event. Filters since/until on
-// se.ts (not s.created_at) so a session created before the window can
-// still contribute to buckets inside it, and vice versa — see the
-// orchestrator comment for the sum-consistency reasoning.
+// filtered window that has at least one event. since/until apply via
+// applySessionFilters (uniform on se.ts across the plugin), so totals
+// and buckets see the same row set — Σ(time_buckets[].counter) ==
+// top-level counter for every counter except session_count.
 //
 // The slice is sparse (missing buckets aren't returned); the caller
 // runs it through fillEmptyBuckets to produce a continuous x-axis.
@@ -1440,7 +1428,7 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 	)
 
 	var args []any
-	applySessionFiltersOn(&q, &args, f, "se.ts")
+	applySessionFilters(&q, &args, f)
 
 	// GROUP BY the same expression we project, ORDER BY the bucket
 	// alias. SQLite accepts both forms; Postgres requires the alias or

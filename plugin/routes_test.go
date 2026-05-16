@@ -1841,3 +1841,203 @@ func TestEventsStats_BucketByDay_BoundaryAtCap(t *testing.T) {
 		t.Errorf("over-cap (1201 days) status = %d, want 400", w.Code)
 	}
 }
+
+// --- Time-axis contract: since/until filter on se.ts uniformly ---
+//
+// Locking tests for the cross-endpoint decision (PR #12 follow-up): the
+// since/until window selects "events that occurred in the window", not
+// "sessions created in the window". A session with created_at outside
+// the window but events inside must contribute; a session with
+// created_at inside but events outside must NOT.
+//
+// These tests are explicit because the surrounding tests use a fixture
+// where se.ts == s.created_at and therefore can't distinguish the two
+// axes. They use their own seed to force the axes apart.
+
+// seedSpanningSessions adds two sessions designed to be distinguishable
+// only by which axis (s.created_at vs se.ts) the time filter uses.
+//
+//	sess_span_inside  created on 2026-04-30 (BEFORE window), event on 2026-05-15 (INSIDE window)
+//	sess_span_outside created on 2026-05-05 (INSIDE window), event on 2026-04-10 (BEFORE window)
+//
+// Filtering window: [2026-05-01, 2026-06-01).
+// Under se.ts (current contract): sess_span_inside matches, sess_span_outside doesn't.
+// Under s.created_at (old contract): sess_span_outside matches, sess_span_inside doesn't.
+func seedSpanningSessions(t *testing.T, db *sql.DB) {
+	t.Helper()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	llm := func(tokIn, tokOut int, costIn, costOut float64) string {
+		return fmt.Sprintf(`{"v":1,"tokens_in":%d,"tokens_out":%d,"cost_input":%g,"cost_output":%g}`,
+			tokIn, tokOut, costIn, costOut)
+	}
+
+	// Container created APRIL, event in MAY — under se.ts contract, IN window.
+	exec(`INSERT INTO sessions VALUES ('sess_span_inside','','gpt-4o','{}','u_ts_inside','tsax','2026-04-30T23:00:00Z','2026-05-15T11:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_ts_inside','sess_span_inside',1,'2026-05-15T10:00:00Z','llm_response',NULL,100,?,'2026-05-15T10:00:00Z')`,
+		llm(700, 350, 0.070, 0.140))
+
+	// Container created MAY, event in APRIL — under se.ts contract, OUT of window.
+	exec(`INSERT INTO sessions VALUES ('sess_span_outside','','gpt-4o','{}','u_ts_outside','tsax','2026-05-05T09:00:00Z','2026-05-05T10:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_ts_outside','sess_span_outside',1,'2026-04-10T10:00:00Z','llm_response',NULL,100,?,'2026-04-10T10:00:00Z')`,
+		llm(800, 400, 0.080, 0.160))
+}
+
+func newSpanningHandler(t *testing.T) *Handler {
+	h := newTestHandler(t)
+	seedSpanningSessions(t, h.db)
+	return h
+}
+
+// /sessions list applies since/until on se.ts: the container-in-April
+// session with event-in-May appears; the container-in-May with
+// event-in-April does NOT. Locks the cross-endpoint contract.
+func TestListSessions_TimeAxisIsEventTimestamp(t *testing.T) {
+	h := newSpanningHandler(t)
+	w := do(t, h, "/sessions?group_id=tsax&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+
+	gotIDs := map[string]bool{}
+	for _, s := range resp.Items {
+		gotIDs[s.ID] = true
+	}
+	if !gotIDs["sess_span_inside"] {
+		t.Errorf("sess_span_inside (event in window) missing from /sessions list: got %v", gotIDs)
+	}
+	if gotIDs["sess_span_outside"] {
+		t.Errorf("sess_span_outside (event outside window) leaked into /sessions list: got %v", gotIDs)
+	}
+}
+
+// /events list applies since/until on se.ts: only the May event appears.
+func TestListEvents_TimeAxisIsEventTimestamp(t *testing.T) {
+	h := newSpanningHandler(t)
+	w := do(t, h, "/events?group_id=tsax&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp EventListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+
+	gotIDs := map[string]bool{}
+	for _, e := range resp.Items {
+		gotIDs[e.ID] = true
+	}
+	if !gotIDs["evt_ts_inside"] {
+		t.Errorf("evt_ts_inside (in window) missing from /events list: got %v", gotIDs)
+	}
+	if gotIDs["evt_ts_outside"] {
+		t.Errorf("evt_ts_outside (outside window) leaked into /events list: got %v", gotIDs)
+	}
+}
+
+// /events/stats (no bucket_by) totals reflect se.ts axis — locks the
+// behavior change introduced with the unified time-axis contract.
+func TestEventsStats_TimeAxisIsEventTimestamp(t *testing.T) {
+	h := newSpanningHandler(t)
+	w := do(t, h, "/events/stats?group_id=tsax&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+
+	// Only sess_span_inside's event contributes: 1 session, 1 event,
+	// 1 llm_response, tokens_in=700, cost_input=0.070.
+	if stats.SessionCount != 1 {
+		t.Errorf("SessionCount = %d, want 1 (sess_span_inside only)", stats.SessionCount)
+	}
+	if stats.EventCount != 1 {
+		t.Errorf("EventCount = %d, want 1", stats.EventCount)
+	}
+	if stats.LLMCallCount != 1 {
+		t.Errorf("LLMCallCount = %d, want 1", stats.LLMCallCount)
+	}
+	if stats.TokensInTotal != 700 {
+		t.Errorf("TokensInTotal = %d, want 700 (sess_span_outside's 800 must NOT contribute)", stats.TokensInTotal)
+	}
+	if stats.CostInputTotal != 0.070 {
+		t.Errorf("CostInputTotal = %g, want 0.070", stats.CostInputTotal)
+	}
+}
+
+// /events/stats?bucket_by= same axis (was always se.ts; locked now in
+// case anyone "fixes" the time-axis back to s.created_at later).
+func TestEventsStats_BucketBy_TimeAxisIsEventTimestamp(t *testing.T) {
+	h := newSpanningHandler(t)
+	w := do(t, h, "/events/stats?group_id=tsax&bucket_by=day&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+
+	byKey := bucketByKey(stats.TimeBuckets)
+	// Event-in-window day must have data.
+	if b := byKey["2026-05-15"]; b.EventCount != 1 || b.TokensInTotal != 700 {
+		t.Errorf("2026-05-15 bucket = %+v, want EventCount=1 TokensInTotal=700", b)
+	}
+	// The container-in-window session has no event in the window — no
+	// stray bucket key from its created_at date.
+	if b, present := byKey["2026-05-05"]; present && (b.EventCount > 0 || b.SessionCount > 0) {
+		t.Errorf("2026-05-05 bucket leaked nonzero data from container-in-window: %+v", b)
+	}
+}
+
+// All four endpoints answer consistently for the same since/until window.
+// If anyone ever splits the axis back across endpoints, this catches it.
+func TestTimeAxis_ConsistentAcrossEndpoints(t *testing.T) {
+	h := newSpanningHandler(t)
+	common := "group_id=tsax&since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z"
+
+	// /sessions: exactly 1 session (sess_span_inside).
+	var listResp SessionListResponse
+	mustUnmarshal(t, do(t, h, "/sessions?"+common).Body.Bytes(), &listResp)
+	if len(listResp.Items) != 1 || listResp.Items[0].ID != "sess_span_inside" {
+		t.Errorf("/sessions returned %d items (%v), want exactly [sess_span_inside]",
+			len(listResp.Items), itemIDs(listResp.Items))
+	}
+
+	// /events: exactly 1 event (evt_ts_inside).
+	var evResp EventListResponse
+	mustUnmarshal(t, do(t, h, "/events?"+common).Body.Bytes(), &evResp)
+	if len(evResp.Items) != 1 || evResp.Items[0].ID != "evt_ts_inside" {
+		t.Errorf("/events returned %d items, want exactly [evt_ts_inside]", len(evResp.Items))
+	}
+
+	// /events/stats (default): SessionCount=1, EventCount=1.
+	var statsDefault EventStats
+	mustUnmarshal(t, do(t, h, "/events/stats?"+common).Body.Bytes(), &statsDefault)
+	if statsDefault.SessionCount != 1 || statsDefault.EventCount != 1 {
+		t.Errorf("/events/stats default = (sess=%d, ev=%d), want (1, 1)",
+			statsDefault.SessionCount, statsDefault.EventCount)
+	}
+
+	// /events/stats?bucket_by=day: top-level matches the default path.
+	var statsBucket EventStats
+	mustUnmarshal(t, do(t, h, "/events/stats?bucket_by=day&"+common).Body.Bytes(), &statsBucket)
+	if statsBucket.SessionCount != statsDefault.SessionCount {
+		t.Errorf("bucket-path SessionCount = %d, default SessionCount = %d (must match)",
+			statsBucket.SessionCount, statsDefault.SessionCount)
+	}
+	if statsBucket.EventCount != statsDefault.EventCount {
+		t.Errorf("bucket-path EventCount = %d, default EventCount = %d (must match)",
+			statsBucket.EventCount, statsDefault.EventCount)
+	}
+}
+
+func itemIDs(items []SessionListItem) []string {
+	out := make([]string, len(items))
+	for i, s := range items {
+		out[i] = s.ID
+	}
+	return out
+}
