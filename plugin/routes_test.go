@@ -117,6 +117,17 @@ func do(t *testing.T, h *Handler, target string) *httptest.ResponseRecorder {
 	return w
 }
 
+// mustStatus fails the test if the response status doesn't match. Used
+// in new tests to cut the repeated "if w.Code != X { t.Fatalf(...) }"
+// boilerplate; existing tests left on the verbose form for now (mass
+// conversion is a separate cleanup).
+func mustStatus(t *testing.T, w *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if w.Code != want {
+		t.Fatalf("status = %d, want %d; body = %s", w.Code, want, w.Body.String())
+	}
+}
+
 func TestHealth(t *testing.T) {
 	w := do(t, newTestHandler(t), "/health")
 	if w.Code != http.StatusOK {
@@ -2204,5 +2215,80 @@ func TestEventsStats_EventTypeFilter_EmptyIsAbsent(t *testing.T) {
 	if w1.Body.String() != w2.Body.String() {
 		t.Errorf("?event_type= should equal no param:\n  no param: %s\n  empty:    %s",
 			w1.Body.String(), w2.Body.String())
+	}
+}
+
+// --- DB-error path coverage (cleanup follow-up) ---
+//
+// Each handler that returns 500 on internal errors must (a) hide the
+// raw DB-error text from the client and (b) still return a JSON-shaped
+// error body. The handlers also log server-side via writeServerErr,
+// but that's not asserted here — log capture isn't worth the test
+// scaffolding for one assertion.
+
+// /health returns 503 when the DB ping fails. Closes the DB before
+// invoking the handler to force the ping failure deterministically.
+func TestHealth_DBUnreachable(t *testing.T) {
+	h := newTestHandler(t)
+	_ = h.db.Close()
+	w := do(t, h, "/health")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "db unreachable") {
+		t.Errorf("body should mention db unreachable, got %s", w.Body.String())
+	}
+}
+
+// /sessions/{id} returns 500 (not 404) on a non-ErrNoRows DB error,
+// and the response body must NOT leak the raw DB error text.
+func TestGetSession_DBError(t *testing.T) {
+	h := newTestHandler(t)
+	_ = h.db.Close() // force any subsequent query to error
+	w := do(t, h, "/sessions/sess_a")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "internal server error") {
+		t.Errorf("body should contain generic 'internal server error', got %s", body)
+	}
+	// Spot-check that we don't leak DB internals to the client.
+	for _, leak := range []string{"sql:", "sqlite", "database is closed"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("body leaks internal error detail %q: %s", leak, body)
+		}
+	}
+}
+
+// /prompt-snapshots returns 500 with generic message on DB error.
+func TestPromptSnapshot_DBError(t *testing.T) {
+	h := newTestHandler(t)
+	_ = h.db.Close()
+	w := do(t, h, "/prompt-snapshots?sha=sha_sys_1")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "internal server error") {
+		t.Errorf("body should contain generic 'internal server error', got %s", w.Body.String())
+	}
+}
+
+// /events bad cursor: mirror of TestListSessions_BadCursor — invalid
+// base64 encoding and malformed two-field payload both 400.
+func TestListEvents_BadCursor(t *testing.T) {
+	h := newTestHandler(t)
+
+	w := do(t, h, "/events?cursor=not-base64!!!")
+	mustStatus(t, w, http.StatusBadRequest)
+	if !strings.Contains(w.Body.String(), "cursor") {
+		t.Errorf("body should mention cursor, got %s", w.Body.String())
+	}
+
+	// Malformed: valid base64 but only one field (no '|').
+	w = do(t, h, "/events?cursor="+base64.RawURLEncoding.EncodeToString([]byte("only-one-field")))
+	mustStatus(t, w, http.StatusBadRequest)
+	if !strings.Contains(w.Body.String(), "cursor") {
+		t.Errorf("body should mention cursor, got %s", w.Body.String())
 	}
 }

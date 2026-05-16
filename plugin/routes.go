@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -521,6 +522,16 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// writeServerErr is the 5xx counterpart of writeErr: logs the real error
+// server-side (with route context for ops) and returns a generic message
+// to the client so SQL details, file paths, dialect quirks, and so on
+// don't leak past the trust boundary. Use this anywhere a non-client
+// error needs to become a 500.
+func writeServerErr(w http.ResponseWriter, r *http.Request, route string, err error) {
+	log.Printf("api-plugin: 500 on %s %s: %v", r.Method, route, err)
+	writeErr(w, http.StatusInternalServerError, "internal server error")
+}
+
 // --- HTTP Handlers ---
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -660,12 +671,12 @@ func resolveSessionSort(s sessionSort, d Dialect) sessionSortDef {
 		}
 		def.BindValue = func(raw string) (any, error) { return strconv.ParseFloat(raw, 64) }
 	case sortKeyLLMCallCount:
-		def.Expr = fmt.Sprintf("SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END)", eventTypeLLMResponse)
+		def.Expr = countEventTypeExpr(eventTypeLLMResponse)
 		def.IsAggregate = true
 		def.Extract = func(r SessionListItem) string { return strconv.Itoa(r.Stats.LLMCallCount) }
 		def.BindValue = func(raw string) (any, error) { return strconv.ParseInt(raw, 10, 64) }
 	case sortKeyToolCallCount:
-		def.Expr = fmt.Sprintf("SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END)", eventTypeToolCallResult)
+		def.Expr = countEventTypeExpr(eventTypeToolCallResult)
 		def.IsAggregate = true
 		def.Extract = func(r SessionListItem) string { return strconv.Itoa(r.Stats.ToolCallCount) }
 		def.BindValue = func(raw string) (any, error) { return strconv.ParseInt(raw, 10, 64) }
@@ -791,12 +802,12 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 	items, next, err := listSessions(h.db, h.dialect, f, sort, cur, limit)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeServerErr(w, r, "/sessions", err)
 		return
 	}
 	totals, err := sessionTotals(h.db, h.dialect, f)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeServerErr(w, r, "/sessions", err)
 		return
 	}
 	writeJSON(w, SessionListResponse{
@@ -814,7 +825,7 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "session not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeServerErr(w, r, "/sessions/{id}", err)
 		return
 	}
 	writeJSON(w, sess)
@@ -850,7 +861,7 @@ func (h *Handler) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		IncludePayload: includePayload,
 	}, cur, limit)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeServerErr(w, r, "/events", err)
 		return
 	}
 	writeJSON(w, EventListResponse{
@@ -867,7 +878,7 @@ func (h *Handler) handleEventsStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats, err := eventsStats(h.db, h.dialect, opts)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeServerErr(w, r, "/events/stats", err)
 		return
 	}
 	writeJSON(w, stats)
@@ -961,13 +972,23 @@ func (h *Handler) handlePromptSnapshot(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "prompt snapshot not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeServerErr(w, r, "/prompt-snapshots", err)
 		return
 	}
 	writeJSON(w, snap)
 }
 
 // --- Query functions ---
+
+// countEventTypeExpr returns the SUM-CASE expression for counting events
+// of a single type. Used in every JIT aggregation that exposes a per-type
+// counter (llm_call_count, tool_call_count). eventType MUST be a hard-
+// coded constant from event_types — never user input — because it's
+// interpolated rather than bound. Centralised so a CASE/SUM tweak only
+// has to happen once.
+func countEventTypeExpr(eventType string) string {
+	return fmt.Sprintf("SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END)", eventType)
+}
 
 // llmAggExpr returns the SUM-CASE expression for an llm_response payload
 // field. Used in every JIT-aggregation query so the per-event filter is
@@ -988,8 +1009,8 @@ func llmAggExpr(d Dialect, field string, isInt bool) string {
 // outer SELECT so each row reads in one query.
 func sessionStatsSelect(d Dialect) string {
 	return strings.Join([]string{
-		fmt.Sprintf("COALESCE(SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END), 0) AS llm_call_count", eventTypeLLMResponse),
-		fmt.Sprintf("COALESCE(SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END), 0) AS tool_call_count", eventTypeToolCallResult),
+		fmt.Sprintf("COALESCE(%s, 0) AS llm_call_count", countEventTypeExpr(eventTypeLLMResponse)),
+		fmt.Sprintf("COALESCE(%s, 0) AS tool_call_count", countEventTypeExpr(eventTypeToolCallResult)),
 		"COALESCE(" + llmAggExpr(d, payloadFieldTokensIn, true) + ", 0) AS tokens_in_total",
 		"COALESCE(" + llmAggExpr(d, payloadFieldTokensOut, true) + ", 0) AS tokens_out_total",
 		"COALESCE(" + llmAggExpr(d, payloadFieldCostInput, false) + ", 0) AS cost_input_total",
@@ -1129,7 +1150,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 		items = append(items, s)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, sessionCursor{}, err
+		return nil, sessionCursor{}, fmt.Errorf("listSessions rows: %w", err)
 	}
 
 	var next sessionCursor
@@ -1148,12 +1169,8 @@ func sessionTotals(db *sql.DB, d Dialect, f sessionFilters) (SessionTotals, erro
 	var q strings.Builder
 	q.WriteString(`SELECT
 		COUNT(DISTINCT s.id) AS session_count,
-		COALESCE(SUM(CASE WHEN se.event_type = '`)
-	q.WriteString(eventTypeLLMResponse)
-	q.WriteString(`' THEN 1 ELSE 0 END), 0) AS llm_call_count,
-		COALESCE(SUM(CASE WHEN se.event_type = '`)
-	q.WriteString(eventTypeToolCallResult)
-	q.WriteString(`' THEN 1 ELSE 0 END), 0) AS tool_call_count,
+		COALESCE(` + countEventTypeExpr(eventTypeLLMResponse) + `, 0) AS llm_call_count,
+		COALESCE(` + countEventTypeExpr(eventTypeToolCallResult) + `, 0) AS tool_call_count,
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensIn, true) + `, 0) AS tokens_in_total,
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensOut, true) + `, 0) AS tokens_out_total,
 		COALESCE(` + llmAggExpr(d, payloadFieldCostInput, false) + `, 0) AS cost_input_total,
@@ -1192,7 +1209,9 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 		&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 		&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal)
 	if err != nil {
-		return nil, err
+		// Wrap with %w so the handler's errors.Is(sql.ErrNoRows) check
+		// for 404 detection still works.
+		return nil, fmt.Errorf("getSession scan: %w", err)
 	}
 	_ = json.Unmarshal([]byte(metadataJSON), &s.Metadata)
 
@@ -1223,11 +1242,14 @@ func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {
 	for rows.Next() {
 		var m Message
 		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &m.CreatedAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("sessionMessages scan: %w", err)
 		}
 		msgs = append(msgs, m)
 	}
-	return msgs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sessionMessages rows: %w", err)
+	}
+	return msgs, nil
 }
 
 func sessionEvents(db *sql.DB, d Dialect, id string) ([]Event, error) {
@@ -1245,12 +1267,15 @@ func sessionEvents(db *sql.DB, d Dialect, id string) ([]Event, error) {
 		var payload string
 		if err := rows.Scan(&e.ID, &e.SessionID, &e.Seq, &e.TS, &e.EventType,
 			&e.ParentID, &e.DurationMS, &payload); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("sessionEvents scan: %w", err)
 		}
 		e.Payload = json.RawMessage(payload)
 		evts = append(evts, e)
 	}
-	return evts, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sessionEvents rows: %w", err)
+	}
+	return evts, nil
 }
 
 // eventListFilters mixes session-shaped filters with event-only filters
@@ -1338,19 +1363,19 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 		if f.IncludePayload {
 			if err := rows.Scan(&e.ID, &e.SessionID, &e.Seq, &e.TS, &e.EventType,
 				&e.ParentID, &e.DurationMS, &payload); err != nil {
-				return nil, cursorPair{}, err
+				return nil, cursorPair{}, fmt.Errorf("listEvents scan (payload): %w", err)
 			}
 			e.Payload = json.RawMessage(payload)
 		} else {
 			if err := rows.Scan(&e.ID, &e.SessionID, &e.Seq, &e.TS, &e.EventType,
 				&e.ParentID, &e.DurationMS); err != nil {
-				return nil, cursorPair{}, err
+				return nil, cursorPair{}, fmt.Errorf("listEvents scan: %w", err)
 			}
 		}
 		items = append(items, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, cursorPair{}, err
+		return nil, cursorPair{}, fmt.Errorf("listEvents rows: %w", err)
 	}
 
 	var next cursorPair
@@ -1441,8 +1466,8 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters, eventType string
 	q.WriteString(`SELECT
 		COUNT(DISTINCT s.id) AS session_count,
 		COUNT(se.id) AS event_count,
-		COALESCE(SUM(CASE WHEN se.event_type = '` + eventTypeLLMResponse + `' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN se.event_type = '` + eventTypeToolCallResult + `' THEN 1 ELSE 0 END), 0),
+		COALESCE(` + countEventTypeExpr(eventTypeLLMResponse) + `, 0),
+		COALESCE(` + countEventTypeExpr(eventTypeToolCallResult) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensIn, true) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensOut, true) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldCostInput, false) + `, 0),
@@ -1481,15 +1506,16 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 	fmt.Fprintf(&q, `SELECT %s AS bucket,
 		COUNT(DISTINCT s.id),
 		COUNT(se.id),
-		COALESCE(SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN se.event_type = '%s' THEN 1 ELSE 0 END), 0),
+		COALESCE(%s, 0),
+		COALESCE(%s, 0),
 		COALESCE(%s, 0),
 		COALESCE(%s, 0),
 		COALESCE(%s, 0),
 		COALESCE(%s, 0)
 		FROM sessions s JOIN session_events se ON se.session_id = s.id WHERE 1=1`,
 		bucketExpr,
-		eventTypeLLMResponse, eventTypeToolCallResult,
+		countEventTypeExpr(eventTypeLLMResponse),
+		countEventTypeExpr(eventTypeToolCallResult),
 		llmAggExpr(d, payloadFieldTokensIn, true),
 		llmAggExpr(d, payloadFieldTokensOut, true),
 		llmAggExpr(d, payloadFieldCostInput, false),
@@ -1605,39 +1631,59 @@ func eventsStatsByEventType(db *sql.DB, d Dialect, f sessionFilters) ([]EventTyp
 // small index scan on (event_type, ts), so the worst case is ~24 cheap
 // lookups in exchange for a portable cross-dialect implementation that
 // avoids array_agg/string_agg dialect drift.
+//
+// The per-bucket query is delegated to sampleSessionIDsForBucket so each
+// iteration owns a defer-scoped rows.Close — putting the defer inside
+// this loop directly would stack closes across all ~24 iterations and
+// hold connection-pool slots until the outer function returns.
 func fillSampleSessionIDs(db *sql.DB, d Dialect, f sessionFilters, buckets []EventTypeBucket, n int) error {
 	for i := range buckets {
-		var q strings.Builder
-		// Inner GROUP BY collapses to one row per (event_type, session_id)
-		// pair with the most-recent ts in that pair; the outer ORDER BY
-		// then ranks sessions by recency within the bucket.
-		q.WriteString(`SELECT session_id FROM (
-			SELECT se.session_id, MAX(se.ts) AS last_ts
-			FROM sessions s JOIN session_events se ON se.session_id = s.id
-			WHERE se.event_type = ?`)
-		args := []any{buckets[i].EventType}
-		applySessionFilters(&q, &args, f)
-		q.WriteString(` GROUP BY se.session_id) sub ORDER BY last_ts DESC, session_id LIMIT ?`)
-		args = append(args, n)
-
-		rows, err := db.Query(d.Rebind(q.String()), args...)
+		ids, err := sampleSessionIDsForBucket(db, d, f, buckets[i].EventType, n)
 		if err != nil {
-			return fmt.Errorf("fillSampleSessionIDs[%s]: %w", buckets[i].EventType, err)
+			return err
 		}
-		for rows.Next() {
-			var sid string
-			if err := rows.Scan(&sid); err != nil {
-				_ = rows.Close()
-				return fmt.Errorf("fillSampleSessionIDs scan: %w", err)
-			}
-			buckets[i].SampleSessionIDs = append(buckets[i].SampleSessionIDs, sid)
-		}
-		_ = rows.Close()
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("fillSampleSessionIDs rows: %w", err)
-		}
+		buckets[i].SampleSessionIDs = ids
 	}
 	return nil
+}
+
+// sampleSessionIDsForBucket returns up to n distinct session IDs that
+// contain at least one event of the given type in the filtered window,
+// ordered by most-recent-event-first. Same row-shape contract as the
+// inline pre-refactor query — extracted purely so the defer-pattern
+// matches the rest of the file (no defer-in-loop).
+func sampleSessionIDsForBucket(db *sql.DB, d Dialect, f sessionFilters, eventType string, n int) ([]string, error) {
+	var q strings.Builder
+	// Inner GROUP BY collapses to one row per (event_type, session_id)
+	// pair with the most-recent ts in that pair; the outer ORDER BY
+	// then ranks sessions by recency within the bucket.
+	q.WriteString(`SELECT session_id FROM (
+		SELECT se.session_id, MAX(se.ts) AS last_ts
+		FROM sessions s JOIN session_events se ON se.session_id = s.id
+		WHERE se.event_type = ?`)
+	args := []any{eventType}
+	applySessionFilters(&q, &args, f)
+	q.WriteString(` GROUP BY se.session_id) sub ORDER BY last_ts DESC, session_id LIMIT ?`)
+	args = append(args, n)
+
+	rows, err := db.Query(d.Rebind(q.String()), args...)
+	if err != nil {
+		return nil, fmt.Errorf("sampleSessionIDsForBucket[%s]: %w", eventType, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			return nil, fmt.Errorf("sampleSessionIDsForBucket scan: %w", err)
+		}
+		ids = append(ids, sid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sampleSessionIDsForBucket rows: %w", err)
+	}
+	return ids, nil
 }
 
 func getPromptSnapshot(db *sql.DB, d Dialect, sha string) (*PromptSnapshot, error) {
