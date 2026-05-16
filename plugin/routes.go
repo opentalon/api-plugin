@@ -331,10 +331,11 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // /events/stats. Centralised so a new filter (e.g. session_id pattern)
 // gets added in one place and reaches both endpoints.
 type sessionFilters struct {
-	EntityID string
-	GroupID  string
-	Since    string // RFC3339, empty = no lower bound
-	Until    string // RFC3339, empty = no upper bound
+	EntityID         string
+	GroupID          string
+	ExcludeEntityIDs []string // entity_ids to exclude from rows AND aggregation
+	Since            string   // RFC3339, empty = no lower bound
+	Until            string   // RFC3339, empty = no upper bound
 }
 
 func filtersFromQuery(r *http.Request) (sessionFilters, error) {
@@ -342,12 +343,73 @@ func filtersFromQuery(r *http.Request) (sessionFilters, error) {
 	if err != nil {
 		return sessionFilters{}, err
 	}
+	excludeIDs, err := parseCommaList(r.URL.Query().Get("exclude_entity_ids"), maxExcludeEntityIDs)
+	if err != nil {
+		return sessionFilters{}, fmt.Errorf("exclude_entity_ids: %w", err)
+	}
 	return sessionFilters{
-		EntityID: r.URL.Query().Get("entity_id"),
-		GroupID:  r.URL.Query().Get("group_id"),
-		Since:    since,
-		Until:    until,
+		EntityID:         r.URL.Query().Get("entity_id"),
+		GroupID:          r.URL.Query().Get("group_id"),
+		ExcludeEntityIDs: excludeIDs,
+		Since:            since,
+		Until:            until,
 	}, nil
+}
+
+// maxExcludeEntityIDs caps the exclude_entity_ids list. Realistic callers
+// hide a handful of internal/staff actors; the cap protects against a
+// pathological URL that would (a) hit SQLite's ~999 bind-param ceiling
+// and (b) produce a NOT IN with thousands of placeholders.
+const maxExcludeEntityIDs = 200
+
+// parseCommaList splits a comma-separated query value into trimmed,
+// non-empty tokens. Returns nil for an empty/whitespace-only input so
+// callers can branch on len(...) without a separate "is set" flag.
+// When max > 0 the result is bounded; exceeding the cap is an error so
+// the caller can return 400 rather than silently dropping ids the
+// requester intended to filter out.
+func parseCommaList(raw string, max int) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if max > 0 && len(out) > max {
+		return nil, fmt.Errorf("at most %d values supported, got %d", max, len(out))
+	}
+	return out, nil
+}
+
+// writeInClause appends ` AND <col> NOT IN (?, ?, …)` with one bind per
+// id. Centralised so applySessionFilters and listEvents share the exact
+// same predicate shape — a future caller (or a third call site) cannot
+// drift.
+func writeInClause(q *strings.Builder, args *[]any, col string, ids []string, negate bool) {
+	if len(ids) == 0 {
+		return
+	}
+	q.WriteString(" AND ")
+	q.WriteString(col)
+	if negate {
+		q.WriteString(" NOT")
+	}
+	q.WriteString(" IN (")
+	for i, id := range ids {
+		if i > 0 {
+			q.WriteString(",")
+		}
+		q.WriteString("?")
+		*args = append(*args, id)
+	}
+	q.WriteString(")")
 }
 
 func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -532,6 +594,10 @@ func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
 		q.WriteString(" AND s.group_id = ?")
 		*args = append(*args, f.GroupID)
 	}
+	// Hits both /sessions (rows + totals) and /events/stats so a caller
+	// filtering "internal users" sees a coherent count and aggregate —
+	// visible rows always sum to the displayed totals.
+	writeInClause(q, args, "s.entity_id", f.ExcludeEntityIDs, true)
 	if f.Since != "" {
 		q.WriteString(" AND s.created_at >= ?")
 		*args = append(*args, f.Since)
@@ -722,7 +788,13 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 	// row multiplication). The JOIN is conditional because the
 	// session_events(event_type, ts) index is the hot path for the
 	// "show me all events of type X in window W" case.
-	needJoin := f.Filters.EntityID != "" || f.Filters.GroupID != ""
+	//
+	// exclude_entity_ids forces the JOIN too, since the predicate sits
+	// on s.entity_id. A call that *only* sets exclude_entity_ids
+	// (no entity_id / group_id / event_type) therefore loses the
+	// type-index fast path — callers in that shape should pair it with
+	// a tight since/until window.
+	needJoin := f.Filters.EntityID != "" || f.Filters.GroupID != "" || len(f.Filters.ExcludeEntityIDs) > 0
 
 	var q strings.Builder
 	q.WriteString(`SELECT se.id, se.session_id, se.seq, se.ts, se.event_type,
@@ -762,6 +834,7 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 			q.WriteString(` AND s.group_id = ?`)
 			args = append(args, f.Filters.GroupID)
 		}
+		writeInClause(&q, &args, "s.entity_id", f.Filters.ExcludeEntityIDs, true)
 	}
 	if cur.TS != "" {
 		q.WriteString(` AND (se.ts < ? OR (se.ts = ? AND se.id < ?))`)

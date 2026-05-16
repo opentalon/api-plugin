@@ -246,6 +246,86 @@ func TestListSessions_EmptyFilterMatch(t *testing.T) {
 	}
 }
 
+func TestListSessions_ExcludeEntityIDs(t *testing.T) {
+	// Single excluded entity_id removes its rows AND its contribution to
+	// totals — the two must always agree (visible rows sum to totals),
+	// otherwise the review UI shows inconsistent numbers.
+	w := do(t, newTestHandler(t), "/sessions?exclude_entity_ids=user_1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].ID != "sess_b" {
+		t.Fatalf("Items = %+v, want exactly sess_b", resp.Items)
+	}
+	if resp.Totals.SessionCount != 1 {
+		t.Errorf("Totals.SessionCount = %d, want 1", resp.Totals.SessionCount)
+	}
+	if resp.Totals.LLMCallCount != 1 {
+		t.Errorf("Totals.LLMCallCount = %d, want 1 (only sess_b's llm_response)", resp.Totals.LLMCallCount)
+	}
+	if resp.Totals.TokensInTotal != 500 {
+		t.Errorf("Totals.TokensInTotal = %d, want 500 (sess_a's 3000 excluded)", resp.Totals.TokensInTotal)
+	}
+	if resp.Totals.CostInputTotal != 0.00125 {
+		t.Errorf("Totals.CostInputTotal = %v, want 0.00125", resp.Totals.CostInputTotal)
+	}
+}
+
+func TestListSessions_ExcludeEntityIDs_MultipleAndWhitespace(t *testing.T) {
+	// Comma-separated list; whitespace and empty tokens are trimmed —
+	// callers can pass " user_1 , ,user_2" without sanitising client-side.
+	w := do(t, newTestHandler(t), "/sessions?exclude_entity_ids=%20user_1%20,%20,user_2")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 0 {
+		t.Errorf("Items = %d, want 0 (both entities excluded)", len(resp.Items))
+	}
+	if resp.Totals.SessionCount != 0 || resp.Totals.LLMCallCount != 0 || resp.Totals.CostInputTotal != 0 {
+		t.Errorf("Totals not zeroed: %+v", resp.Totals)
+	}
+}
+
+func TestListSessions_ExcludeEntityIDs_EmptyParamIsNoop(t *testing.T) {
+	// Empty value must not flip the filter into "exclude everything"; the
+	// default contract (return all sessions) has to stay backward compatible.
+	w := do(t, newTestHandler(t), "/sessions?exclude_entity_ids=")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 2 || resp.Totals.SessionCount != 2 {
+		t.Errorf("got %d items / SessionCount=%d, want 2/2", len(resp.Items), resp.Totals.SessionCount)
+	}
+}
+
+func TestListSessions_ExcludeEntityIDs_OverCap(t *testing.T) {
+	// Pathological 10k-id list would otherwise build a 10k-placeholder
+	// NOT IN and trip SQLite's ~999 bind ceiling. Cap is enforced server-
+	// side as 400 so the caller learns rather than getting truncated
+	// silently — silent truncation would let through ids the requester
+	// meant to exclude.
+	var b strings.Builder
+	for i := 0; i < maxExcludeEntityIDs+1; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(fmt.Sprintf("u%d", i))
+	}
+	w := do(t, newTestHandler(t), "/sessions?exclude_entity_ids="+b.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (over cap); body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "exclude_entity_ids") {
+		t.Errorf("error body missing param name for debugging: %s", w.Body.String())
+	}
+}
+
 func TestListSessions_BadCursor(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions?cursor=not-base64")
 	if w.Code != http.StatusBadRequest {
@@ -353,6 +433,28 @@ func TestListEvents_CursorPagination(t *testing.T) {
 	}
 }
 
+func TestListEvents_ExcludeEntityIDs(t *testing.T) {
+	// /events listing must honour exclude_entity_ids too — forces the
+	// otherwise-optional JOIN onto sessions, then applies the same
+	// NOT IN predicate as /sessions. Without the JOIN-forcing branch
+	// the filter would silently no-op when entity_id/group_id are unset.
+	w := do(t, newTestHandler(t), "/events?exclude_entity_ids=user_1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp EventListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	// sess_a's 2 llm_response events excluded, only sess_b's 2 events remain.
+	if len(resp.Items) != 2 {
+		t.Errorf("Items = %d, want 2 (sess_a's 2 events excluded)", len(resp.Items))
+	}
+	for _, e := range resp.Items {
+		if e.SessionID != "sess_b" {
+			t.Errorf("event %s belongs to %s, want sess_b only", e.ID, e.SessionID)
+		}
+	}
+}
+
 func TestListEvents_PayloadOmittedWhenRequested(t *testing.T) {
 	w := do(t, newTestHandler(t), "/events?include_payload=false")
 	var resp EventListResponse
@@ -398,6 +500,27 @@ func TestEventsStats_FilteredByGroup(t *testing.T) {
 	}
 	if stats.LLMCallCount != 2 {
 		t.Errorf("LLMCallCount = %d, want 2 (only sess_a)", stats.LLMCallCount)
+	}
+}
+
+func TestEventsStats_ExcludeEntityIDs(t *testing.T) {
+	// /events/stats must apply exclude_entity_ids identically to /sessions
+	// — same filter helper, same SQL. Without that guarantee a caller's
+	// list/totals tile and stats dashboard would disagree.
+	w := do(t, newTestHandler(t), "/events/stats?exclude_entity_ids=user_1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if stats.SessionCount != 1 {
+		t.Errorf("SessionCount = %d, want 1 (sess_a excluded)", stats.SessionCount)
+	}
+	if stats.LLMCallCount != 1 {
+		t.Errorf("LLMCallCount = %d, want 1 (only sess_b's llm_response)", stats.LLMCallCount)
+	}
+	if stats.TokensInTotal != 500 {
+		t.Errorf("TokensInTotal = %d, want 500 (sess_a's 3000 excluded)", stats.TokensInTotal)
 	}
 }
 

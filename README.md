@@ -22,6 +22,11 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 
 - `entity_id` — opentalon entity (in Timly terms: the **user**)
 - `group_id` — opentalon group (in Timly terms: the **entity**)
+- `exclude_entity_ids` — comma-separated list of entity_ids to exclude
+  from rows **and** aggregation. Use it to keep list, totals, and
+  `/events/stats` numbers in lockstep when hiding a subset of actors
+  (e.g. support staff who shouldn't count against a tenant's cost view).
+  Empty value and unknown ids are no-ops.
 - `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive
 - `limit` — page size, default 25, capped at 200
 
@@ -131,9 +136,10 @@ curl -s https://opentalon.example.com/api/health
 curl -s -H "Authorization: Bearer your-secret-token" \
   'https://opentalon.example.com/api/sessions?entity_id=user_1&since=2024-01-01T00:00:00Z&limit=25'
 
-# Cross-session cost rollup for a group
+# Cross-session cost rollup for a group, excluding internal/staff actors
+# so list rows and totals stay coherent for a tenant-facing cost view
 curl -s -H "Authorization: Bearer your-secret-token" \
-  'https://opentalon.example.com/api/events/stats?group_id=team-a&since=2024-01-01T00:00:00Z'
+  'https://opentalon.example.com/api/events/stats?group_id=team-a&since=2024-01-01T00:00:00Z&exclude_entity_ids=staff_42,staff_43'
 
 # Event-type breakdown + drill-down sample IDs in one round-trip
 curl -s -H "Authorization: Bearer your-secret-token" \
