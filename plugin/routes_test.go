@@ -2086,19 +2086,23 @@ func TestListEvents_IncludePayloadValidation(t *testing.T) {
 	}
 }
 
-// limit: garbage → 400, over-cap → silent clamp (option B from the audit).
-// Locks the chosen middle path: be strict about consumer mistakes
-// (banana, negative, zero) but tolerant of "give me everything" intent.
-func TestLimitValidation_StrictGarbageTolerantOverCap(t *testing.T) {
+// limit: any value outside (1..maxLimit] → 400. Matches the strictness
+// of every other cap in the API (entity ID lists, sample_sessions,
+// bucket counts). Consumer wanting more rows uses cursor pagination.
+func TestLimitValidation_StrictOnAllBounds(t *testing.T) {
 	h := newBucketHandler(t)
 
-	// Garbage / non-positive → 400 on every endpoint that uses limitFromQuery.
 	for _, target := range []string{
+		// Garbage / non-positive
 		"/sessions?limit=banana",
 		"/sessions?limit=0",
 		"/sessions?limit=-5",
 		"/events?limit=banana",
 		"/events?limit=0",
+		// Over-cap
+		"/sessions?limit=999999",
+		"/sessions?limit=201",
+		"/events?limit=201",
 	} {
 		w := do(t, h, target)
 		if w.Code != http.StatusBadRequest {
@@ -2109,15 +2113,11 @@ func TestLimitValidation_StrictGarbageTolerantOverCap(t *testing.T) {
 		}
 	}
 
-	// Over-cap → clamps to maxLimit (200), still 200 OK.
-	w := do(t, h, "/sessions?limit=999999")
+	// At cap (exactly maxLimit) — still 200 OK, boundary case.
+	w := do(t, h, "/sessions?limit=200")
 	if w.Code != http.StatusOK {
-		t.Fatalf("/sessions?limit=999999: status = %d, want 200 (clamped); body = %s", w.Code, w.Body.String())
+		t.Fatalf("/sessions?limit=200 (at-cap): status = %d, want 200; body = %s", w.Code, w.Body.String())
 	}
-	// We can't easily assert exactly 200 items returned (fixture is small),
-	// but the response must be valid JSON with items present.
-	var resp SessionListResponse
-	mustUnmarshal(t, w.Body.Bytes(), &resp)
 }
 
 // --- event_type filter on /events/stats (cleanup follow-up to PR #12) ---

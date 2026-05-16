@@ -37,7 +37,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
   Empty value and unknown ids are no-ops; capped at 200. ANDs with
   `include_entity_ids` if both are set.
 - `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive. **Filter on event timestamp uniformly across all endpoints**: a session with `created_at` before the window but events inside is included; a session with `created_at` inside the window but events outside is not. Containers vs activity — the API tracks activity.
-- `limit` — page size, default 25, capped at 200. Non-numeric values or ≤ 0 → 400 (almost always a consumer mistake). Values above the cap silently clamp to 200 — "give me everything" is a legitimate intent and the cursor lets the consumer page through.
+- `limit` — page size, default 25, capped at 200. Any value outside `(1..200]` → 400 (matches the strictness of every other cap in the API). To page through more rows, use the returned `next_cursor`.
 
 `/events` adds:
 

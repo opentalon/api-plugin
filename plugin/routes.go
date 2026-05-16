@@ -357,11 +357,11 @@ const (
 
 // limitFromQuery reads ?limit= with defaults + cap.
 //
-// Empty value → defaultLimit. Garbage ("banana") or ≤ 0 → 400, since
-// that's almost certainly a consumer mistake the silent-default would
-// hide. A value above maxLimit clamps rather than rejects — "I wanted
-// everything" is a legitimate intent and a 200-row response + cursor is
-// the helpful answer.
+// Empty value → defaultLimit. Anything outside (1..maxLimit] → 400.
+// "Out of bounds → 400" matches every other cap in the API (entity ID
+// lists, sample_sessions, bucket counts). A consumer wanting more rows
+// than maxLimit should use cursor pagination — silent clamping would
+// hide the constraint and surprise the caller who expected v rows back.
 func limitFromQuery(r *http.Request) (int, error) {
 	raw := r.URL.Query().Get("limit")
 	if raw == "" {
@@ -372,7 +372,7 @@ func limitFromQuery(r *http.Request) (int, error) {
 		return 0, fmt.Errorf("limit: must be a positive integer, got %q", raw)
 	}
 	if v > maxLimit {
-		return maxLimit, nil
+		return 0, fmt.Errorf("limit: at most %d, got %d", maxLimit, v)
 	}
 	return v, nil
 }
