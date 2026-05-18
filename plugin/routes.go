@@ -356,6 +356,7 @@ func bucketCountExceeds(since, until time.Time, granularity string, cap int) boo
 // through anyway, we just don't pre-classify it here.
 const (
 	eventTypeLLMResponse    = "llm_response"
+	eventTypeLLMError       = "llm_error"
 	eventTypeToolCallResult = "tool_call_result"
 )
 
@@ -1240,6 +1241,7 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 	}
 
 	annotateAssistantToolCalls(msgs, evts)
+	msgs = mergeErrorMessages(msgs, evts)
 
 	s.Messages = msgs
 	s.Events = evts
@@ -1283,6 +1285,123 @@ func annotateAssistantToolCalls(msgs []Message, evts []Event) {
 		}
 		ei++
 	}
+}
+
+// mergeErrorMessages inserts a synthetic `role:"error"` Message for each
+// `llm_error` event that has no matching messages-row. The orchestrator
+// writes one messages-row per successful `llm_response` event but writes
+// nothing on `llm_error` — so a failed turn shows up as the conversation
+// simply ending after the user question with no acknowledgement when the
+// diagnostic page renders only `Messages`. The synthetic row makes the
+// failure visible without polluting the `messages` table (which the
+// orchestrator reads back into the next turn's LLM context).
+//
+// Pairing is purely timestamp-based: errors are interleaved between real
+// messages by chronological comparison of parsed RFC 3339 times. We
+// cannot string-compare here: messages.created_at is written by Core's
+// `sessions.AddMessage` via `time.Now().Format(time.RFC3339)` (second
+// precision) while session_events.ts is microsecond-precision. Within
+// the same wall-clock second, a sub-second event ts (`...36.050Z`)
+// lex-sorts BEFORE the unfractioned message ts (`...36Z`) because `.`
+// (0x2E) < `Z` (0x5A) — which would mis-order the synthetic row.
+// time.Parse + time.Before is precision-agnostic. The function
+// preserves caller ordering for messages and returns a new slice
+// (length grows by the number of unmatched errors); ToolCalls
+// annotations done by `annotateAssistantToolCalls` survive intact
+// because real messages are copied through by value.
+//
+// `Seq` on synthetic rows is 0 — a documented sentinel, not a real
+// position in the messages table. Consumers must not assume Seq is
+// monotonic across the returned slice; ordering is given by slice
+// position. `CreatedAt` mirrors the source event's `ts` so the row
+// renders at the right point in the chronological view.
+func mergeErrorMessages(msgs []Message, evts []Event) []Message {
+	type pairedError struct {
+		event Event
+		t     time.Time
+	}
+	var errs []pairedError
+	for _, e := range evts {
+		if e.EventType != eventTypeLLMError {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339Nano, e.TS)
+		if err != nil {
+			// Malformed event ts is upstream-corrupt; skip rather than
+			// fall back to lexicographic compare (which would mis-order
+			// against second-precision message timestamps).
+			continue
+		}
+		errs = append(errs, pairedError{event: e, t: t})
+	}
+	if len(errs) == 0 {
+		return msgs
+	}
+
+	out := make([]Message, 0, len(msgs)+len(errs))
+	ei := 0
+	for _, m := range msgs {
+		mt, err := time.Parse(time.RFC3339Nano, m.CreatedAt)
+		if err != nil {
+			// Can't place this message chronologically — keep it where
+			// it is and don't splice any errors against it.
+			out = append(out, m)
+			continue
+		}
+		for ei < len(errs) && errs[ei].t.Before(mt) {
+			out = append(out, syntheticErrorMessage(errs[ei].event))
+			ei++
+		}
+		out = append(out, m)
+	}
+	for ; ei < len(errs); ei++ {
+		out = append(out, syntheticErrorMessage(errs[ei].event))
+	}
+	return out
+}
+
+// llmErrorFallback is rendered when the llm_error payload carries no
+// usable excerpt — either the payload is missing/malformed or the
+// excerpt is empty or exceeds llmErrorExcerptMax. Operators still get a
+// clear "this turn failed" signal in the diagnostic page; the technical
+// detail is one click away in the Nerd-Mode event payload viewer.
+const (
+	llmErrorFallback   = "[LLM error] The request could not be completed."
+	llmErrorExcerptMax = 200
+)
+
+// syntheticErrorMessage builds a virtual messages-row from an llm_error
+// event. The fields it sets are: Role (always "error"), Content (derived
+// from payload), CreatedAt (mirrors event ts). Seq stays at the zero
+// value as a synthetic-row marker — see mergeErrorMessages godoc.
+func syntheticErrorMessage(e Event) Message {
+	return Message{
+		Role:      "error",
+		Content:   errorContentFromPayload(e.Payload),
+		CreatedAt: e.TS,
+	}
+}
+
+// errorContentFromPayload extracts a short user-visible string from the
+// llm_error payload. Current Core writers stamp `response_body_excerpt`
+// (the upstream HTTP body or transport error message); if that's
+// present and short enough we inline it so operators can distinguish
+// timeouts from rate-limits without opening the event. Long excerpts
+// fall back to a static string to keep the bubble UI tidy.
+func errorContentFromPayload(payload json.RawMessage) string {
+	if len(payload) == 0 {
+		return llmErrorFallback
+	}
+	var p struct {
+		ResponseBodyExcerpt string `json:"response_body_excerpt"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return llmErrorFallback
+	}
+	if p.ResponseBodyExcerpt == "" || len(p.ResponseBodyExcerpt) > llmErrorExcerptMax {
+		return llmErrorFallback
+	}
+	return "[LLM error] " + p.ResponseBodyExcerpt
 }
 
 func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {
