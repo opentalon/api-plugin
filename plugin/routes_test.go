@@ -871,6 +871,167 @@ func TestGetSession_EmptyToolCallsOmitted(t *testing.T) {
 	}
 }
 
+// TestGetSession_SynthesisesErrorRowFromLLMError covers the failed-turn
+// case: a session where the LLM call never produced a response (timeout,
+// connect refused, 5xx). The orchestrator emits `llm_error` into
+// session_events but writes nothing to the messages table — left
+// uncorrected, the diagnostic page would show the conversation ending
+// after the user question with no acknowledgement. The synthetic
+// `role:"error"` row makes the failure visible without touching the
+// underlying messages table (which the orchestrator reads back into the
+// next turn's LLM context).
+func TestGetSession_SynthesisesErrorRowFromLLMError(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_err','failed turn','gpt-4o','{}','user_4','group_z','2024-04-01T10:00:00Z','2024-04-01T10:00:05Z')`)
+
+	// Only the user message exists — the LLM call errored before any
+	// assistant row could be written.
+	exec(`INSERT INTO messages VALUES ('sess_err',1,'user','Wieviele Items habe ich?','2024-04-01T10:00:00Z')`)
+
+	// Full turn-startup events (knowledge_retrieval, turn_start,
+	// llm_request) are omitted from this seed — they're irrelevant to
+	// the merge. The pairing key is the `llm_error` event itself plus
+	// its timestamp.
+	exec(`INSERT INTO session_events VALUES ('evt_err1','sess_err',1,'2024-04-01T10:00:00.500Z','llm_request',NULL,0,'{}','2024-04-01T10:00:00.500Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_err2','sess_err',2,'2024-04-01T10:00:02Z','llm_error',NULL,0,'{"v":1,"phase":"chat.transport","response_body_excerpt":"context deadline exceeded"}','2024-04-01T10:00:02Z')`)
+
+	w := do(t, h, "/sessions/sess_err")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	if len(s.Messages) != 2 {
+		t.Fatalf("got %d messages, want 2 (user + synthetic error); body = %s", len(s.Messages), w.Body.String())
+	}
+	if s.Messages[0].Role != "user" {
+		t.Errorf("messages[0].Role = %q, want user", s.Messages[0].Role)
+	}
+	if s.Messages[1].Role != "error" {
+		t.Errorf("messages[1].Role = %q, want error", s.Messages[1].Role)
+	}
+	if !strings.Contains(s.Messages[1].Content, "context deadline exceeded") {
+		t.Errorf("messages[1].Content = %q, want it to inline the response_body_excerpt", s.Messages[1].Content)
+	}
+	if s.Messages[1].CreatedAt != "2024-04-01T10:00:02Z" {
+		t.Errorf("messages[1].CreatedAt = %q, want it to mirror the llm_error ts", s.Messages[1].CreatedAt)
+	}
+}
+
+// TestGetSession_DoesNotInjectWhenSessionIsClean is the regression guard
+// that the existing TestGetSession_FullDetail fixture (which has zero
+// llm_error events) keeps returning byte-identical 2-message output.
+// Otherwise this PR would silently grow the response on every clean
+// session.
+func TestGetSession_DoesNotInjectWhenSessionIsClean(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	if len(s.Messages) != 2 {
+		t.Fatalf("got %d messages, want 2 (no synthesis on clean session); body = %s", len(s.Messages), w.Body.String())
+	}
+	for i, m := range s.Messages {
+		if m.Role == "error" {
+			t.Errorf("messages[%d] is role=error on a clean session; full = %+v", i, s.Messages)
+		}
+	}
+}
+
+// TestGetSession_ErrorRowInterleavedByTimestamp covers the multi-turn
+// case: a session where the first turn succeeded normally, then a
+// follow-up turn failed. The synthetic error row must land *after* the
+// successful assistant message and the second user message — pairing is
+// by timestamp, not by ordinal, so it survives any future event-order
+// changes upstream.
+func TestGetSession_ErrorRowInterleavedByTimestamp(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session','gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z')`)
+
+	// Turn 1: user → assistant (successful).
+	exec(`INSERT INTO messages VALUES ('sess_mix',1,'user','hi','2024-05-01T10:00:00Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_mix',2,'assistant','hello','2024-05-01T10:00:01Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_mx1','sess_mix',1,'2024-05-01T10:00:01Z','llm_response',NULL,100,'{"v":1}','2024-05-01T10:00:01Z')`)
+
+	// Turn 2: user → llm_error (failed, no assistant row).
+	exec(`INSERT INTO messages VALUES ('sess_mix',3,'user','tell me more','2024-05-01T10:00:10Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_mx2','sess_mix',2,'2024-05-01T10:00:12Z','llm_error',NULL,0,'{"v":1,"phase":"chat.transport","response_body_excerpt":"connection refused"}','2024-05-01T10:00:12Z')`)
+
+	w := do(t, h, "/sessions/sess_mix")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	if len(s.Messages) != 4 {
+		t.Fatalf("got %d messages, want 4 (user, assistant, user, error); body = %s", len(s.Messages), w.Body.String())
+	}
+	wantRoles := []string{"user", "assistant", "user", "error"}
+	for i, want := range wantRoles {
+		if s.Messages[i].Role != want {
+			t.Errorf("messages[%d].Role = %q, want %q (full sequence: %+v)", i, s.Messages[i].Role, want, rolesOf(s.Messages))
+		}
+	}
+	if !strings.Contains(s.Messages[3].Content, "connection refused") {
+		t.Errorf("messages[3].Content = %q, want it to inline the response_body_excerpt", s.Messages[3].Content)
+	}
+}
+
+// TestGetSession_ErrorContentFallback covers payloads that don't carry
+// a usable excerpt (oversized, malformed, or missing field). The
+// synthetic row falls back to a static string so the diagnostic page
+// still shows "this turn failed" without leaking pathological
+// upstream blobs into the chat-bubble view.
+func TestGetSession_ErrorContentFallback(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session','gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_fb',1,'user','q','2024-06-01T10:00:00Z')`)
+	// Payload is valid JSON but has no response_body_excerpt — must fall back.
+	exec(`INSERT INTO session_events VALUES ('evt_fb1','sess_fb',1,'2024-06-01T10:00:02Z','llm_error',NULL,0,'{"v":1,"phase":"chat.parse"}','2024-06-01T10:00:02Z')`)
+
+	w := do(t, h, "/sessions/sess_fb")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	if len(s.Messages) != 2 || s.Messages[1].Role != "error" {
+		t.Fatalf("expected one synthetic error row; got %+v", rolesOf(s.Messages))
+	}
+	if s.Messages[1].Content != "[LLM error] The request could not be completed." {
+		t.Errorf("messages[1].Content = %q, want static fallback (payload had no response_body_excerpt)", s.Messages[1].Content)
+	}
+}
+
+// rolesOf is a small test helper that produces a compact role-only
+// snapshot of a Messages slice for use in t.Errorf — easier to scan
+// than printing the full Message struct on every diagnostic line.
+func rolesOf(msgs []Message) []string {
+	out := make([]string, len(msgs))
+	for i, m := range msgs {
+		out[i] = m.Role
+	}
+	return out
+}
+
 func TestListEvents_FilterByType(t *testing.T) {
 	w := do(t, newTestHandler(t), "/events?event_type=tool_call_result")
 	var resp EventListResponse
