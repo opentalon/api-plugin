@@ -1297,13 +1297,18 @@ func annotateAssistantToolCalls(msgs []Message, evts []Event) {
 // orchestrator reads back into the next turn's LLM context).
 //
 // Pairing is purely timestamp-based: errors are interleaved between real
-// messages by `e.TS < m.CreatedAt`. Both are RFC 3339 strings and sort
-// lexicographically the same as chronologically, so a simple merge of two
-// already-sorted streams suffices. The function preserves caller
-// ordering for messages and returns a new slice (length grows by the
-// number of unmatched errors); ToolCalls annotations done by
-// `annotateAssistantToolCalls` survive intact because real messages are
-// copied through by value.
+// messages by chronological comparison of parsed RFC 3339 times. We
+// cannot string-compare here: messages.created_at is written by Core's
+// `sessions.AddMessage` via `time.Now().Format(time.RFC3339)` (second
+// precision) while session_events.ts is microsecond-precision. Within
+// the same wall-clock second, a sub-second event ts (`...36.050Z`)
+// lex-sorts BEFORE the unfractioned message ts (`...36Z`) because `.`
+// (0x2E) < `Z` (0x5A) — which would mis-order the synthetic row.
+// time.Parse + time.Before is precision-agnostic. The function
+// preserves caller ordering for messages and returns a new slice
+// (length grows by the number of unmatched errors); ToolCalls
+// annotations done by `annotateAssistantToolCalls` survive intact
+// because real messages are copied through by value.
 //
 // `Seq` on synthetic rows is 0 — a documented sentinel, not a real
 // position in the messages table. Consumers must not assume Seq is
@@ -1311,11 +1316,23 @@ func annotateAssistantToolCalls(msgs []Message, evts []Event) {
 // position. `CreatedAt` mirrors the source event's `ts` so the row
 // renders at the right point in the chronological view.
 func mergeErrorMessages(msgs []Message, evts []Event) []Message {
-	var errs []Event
+	type pairedError struct {
+		event Event
+		t     time.Time
+	}
+	var errs []pairedError
 	for _, e := range evts {
-		if e.EventType == eventTypeLLMError {
-			errs = append(errs, e)
+		if e.EventType != eventTypeLLMError {
+			continue
 		}
+		t, err := time.Parse(time.RFC3339Nano, e.TS)
+		if err != nil {
+			// Malformed event ts is upstream-corrupt; skip rather than
+			// fall back to lexicographic compare (which would mis-order
+			// against second-precision message timestamps).
+			continue
+		}
+		errs = append(errs, pairedError{event: e, t: t})
 	}
 	if len(errs) == 0 {
 		return msgs
@@ -1324,14 +1341,21 @@ func mergeErrorMessages(msgs []Message, evts []Event) []Message {
 	out := make([]Message, 0, len(msgs)+len(errs))
 	ei := 0
 	for _, m := range msgs {
-		for ei < len(errs) && errs[ei].TS < m.CreatedAt {
-			out = append(out, syntheticErrorMessage(errs[ei]))
+		mt, err := time.Parse(time.RFC3339Nano, m.CreatedAt)
+		if err != nil {
+			// Can't place this message chronologically — keep it where
+			// it is and don't splice any errors against it.
+			out = append(out, m)
+			continue
+		}
+		for ei < len(errs) && errs[ei].t.Before(mt) {
+			out = append(out, syntheticErrorMessage(errs[ei].event))
 			ei++
 		}
 		out = append(out, m)
 	}
 	for ; ei < len(errs); ei++ {
-		out = append(out, syntheticErrorMessage(errs[ei]))
+		out = append(out, syntheticErrorMessage(errs[ei].event))
 	}
 	return out
 }

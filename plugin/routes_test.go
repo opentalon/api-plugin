@@ -990,6 +990,54 @@ func TestGetSession_ErrorRowInterleavedByTimestamp(t *testing.T) {
 	}
 }
 
+// TestGetSession_PrecisionMismatchOrdersErrorAfterMessage is the
+// regression guard for the precision-mismatch bug. messages.created_at
+// is written by Core's `sessions.AddMessage` at second precision
+// (`time.Now().Format(time.RFC3339)`), while session_events.ts is
+// microsecond precision. Within the same wall-clock second, a
+// sub-second event ts (`...36.050Z`) lex-sorts BEFORE the unfractioned
+// message ts (`...36Z`) because `.` (0x2E) < `Z` (0x5A) — which would
+// place the synthetic error row BEFORE the user message that opened
+// the failed turn. Verified live in opentalon_dev on 2026-05-18:
+// the chat UI rendered the error row above the user message.
+//
+// The fix parses both stamps as time.Time and uses time.Before for
+// chronological (not lexicographic) comparison.
+func TestGetSession_PrecisionMismatchOrdersErrorAfterMessage(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_prec','precision session','gpt-4o','{}','user_7','group_z','2024-07-01T10:00:00Z','2024-07-01T10:00:05Z')`)
+
+	// Real-world shape: user message at second precision, llm_error at
+	// microsecond precision within the same wall-clock second. The
+	// event actually happened ~50 ms AFTER the message was written —
+	// the synthetic error row must land AFTER the user.
+	exec(`INSERT INTO messages VALUES ('sess_prec',1,'user','q','2024-07-01T10:00:01Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_pr1','sess_prec',1,'2024-07-01T10:00:01.050745Z','llm_error',NULL,0,'{"v":1,"phase":"chat.transport","response_body_excerpt":"dial tcp: connect refused"}','2024-07-01T10:00:01.050745Z')`)
+
+	w := do(t, h, "/sessions/sess_prec")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	wantRoles := []string{"user", "error"}
+	got := rolesOf(s.Messages)
+	if len(s.Messages) != len(wantRoles) {
+		t.Fatalf("got %d messages, want %d (sequence %v); body = %s", len(s.Messages), len(wantRoles), got, w.Body.String())
+	}
+	for i, want := range wantRoles {
+		if s.Messages[i].Role != want {
+			t.Errorf("messages[%d].Role = %q, want %q (full sequence: %v)", i, s.Messages[i].Role, want, got)
+		}
+	}
+}
+
 // TestGetSession_ErrorContentFallback covers payloads that don't carry
 // a usable excerpt (oversized, malformed, or missing field). The
 // synthetic row falls back to a static string so the diagnostic page
