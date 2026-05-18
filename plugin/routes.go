@@ -7,6 +7,7 @@
 package plugin
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -116,11 +117,24 @@ type SessionDetail struct {
 }
 
 // Message is one row of the messages table — the user/assistant transcript.
+//
+// ToolCalls is a passthrough of the matching llm_response event's
+// payload.native_tool_calls_raw — the raw provider-shaped tool-call
+// array (id, type, function.name, function.arguments). It is populated
+// only on assistant rows that actually invoked tools and is omitted
+// otherwise, so user/tool rows (and assistant rows that emitted only
+// text) stay byte-identical to the pre-passthrough contract.
+//
+// The messages table itself does not store tool_calls; the data lives in
+// session_events.payload, and the serializer pairs the n-th assistant
+// message with the n-th llm_response event in chronological order — the
+// orchestrator's 1:1 contract. See annotateAssistantToolCalls.
 type Message struct {
-	Seq       int    `json:"seq"`
-	Role      string `json:"role"`
-	Content   string `json:"content"`
-	CreatedAt string `json:"created_at"`
+	Seq       int             `json:"seq"`
+	Role      string          `json:"role"`
+	Content   string          `json:"content"`
+	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	CreatedAt string          `json:"created_at"`
 }
 
 // Event is one row of session_events. Payload is inlined as a raw JSON
@@ -1219,15 +1233,56 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.Messages = msgs
 
 	evts, err := sessionEvents(db, d, id)
 	if err != nil {
 		return nil, err
 	}
+
+	annotateAssistantToolCalls(msgs, evts)
+
+	s.Messages = msgs
 	s.Events = evts
 
 	return &s, nil
+}
+
+// annotateAssistantToolCalls copies payload.native_tool_calls_raw from
+// each llm_response event onto the corresponding assistant message in
+// chronological order. The orchestrator emits exactly one llm_response
+// event per assistant message row, in matching order — that's the
+// pairing contract, by ordinal rather than by seq (the messages table
+// and session_events table maintain independent seq sequences).
+//
+// Empty arrays and explicit nulls are omitted: the field exists on
+// Message only when the assistant actually invoked tools, so user/tool
+// rows and text-only assistant rows stay byte-identical to the
+// pre-passthrough contract. If the event payload is malformed or has
+// no key, the message simply gets no tool_calls field — the failure
+// mode is "missing optional metadata", not "endpoint 500s".
+func annotateAssistantToolCalls(msgs []Message, evts []Event) {
+	ei := 0
+	for mi := range msgs {
+		if msgs[mi].Role != "assistant" {
+			continue
+		}
+		for ei < len(evts) && evts[ei].EventType != eventTypeLLMResponse {
+			ei++
+		}
+		if ei >= len(evts) {
+			return
+		}
+		var p struct {
+			NativeToolCallsRaw json.RawMessage `json:"native_tool_calls_raw"`
+		}
+		if err := json.Unmarshal(evts[ei].Payload, &p); err == nil && len(p.NativeToolCallsRaw) > 0 {
+			tc := bytes.TrimSpace(p.NativeToolCallsRaw)
+			if !bytes.Equal(tc, []byte("null")) && !bytes.Equal(tc, []byte("[]")) {
+				msgs[mi].ToolCalls = p.NativeToolCallsRaw
+			}
+		}
+		ei++
+	}
 }
 
 func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {

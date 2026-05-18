@@ -93,6 +93,26 @@ The cursor format extends to four fields — `<sort>|<direction>|<value>|<id>`, 
 
 `/events/stats` returns just the totals block by default.
 
+#### Assistant `tool_calls` on `/sessions/{id}`
+
+Each assistant row in `messages[]` carries an optional `tool_calls` field — the raw provider-shaped tool-call array (`id`, `type`, `function.name`, `function.arguments`) lifted verbatim from the matching `llm_response` event's `payload.native_tool_calls_raw`. The field is omitted on rows that did not invoke tools, so user/tool rows and text-only assistant rows stay byte-identical to the pre-passthrough shape.
+
+Pairing is by ordinal: the n-th assistant message receives the n-th `llm_response` event's tool calls (the orchestrator's 1:1 chronological contract). Tool-calling assistant turns therefore render as a single message row with `content` (may be empty) plus `tool_calls`, rather than forcing the consumer to stitch the call back out of the event stream.
+
+```jsonc
+// GET /sessions/{id} — assistant turn that emitted tool calls only
+{
+  "seq": 2,
+  "role": "assistant",
+  "content": "",
+  "tool_calls": [
+    { "id": "call_1", "type": "function",
+      "function": { "name": "list-items", "arguments": "{}" } }
+  ],
+  "created_at": "..."
+}
+```
+
 #### Optional grouping on `/events/stats`
 
 To answer "what's going wrong in conversations" in one round-trip instead of N parallel calls, `/events/stats` accepts two optional params:

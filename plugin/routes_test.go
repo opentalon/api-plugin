@@ -766,6 +766,111 @@ func TestGetSession_NotFound(t *testing.T) {
 	}
 }
 
+// TestGetSession_ToolCallsPassthrough is the regression guard for the
+// messages-serializer fix that started shipping native_tool_calls_raw
+// to consumers. Before this fix /sessions/{id} rendered tool-calling
+// assistant turns as `content:""` with no tool_calls field, forcing the
+// chat-bubble consumer to reconstruct the call from the events stream.
+//
+// Pairing contract under test: n-th assistant message ↔ n-th
+// llm_response event, by ordinal. Non-assistant rows (user, tool) and
+// text-only assistant rows must not gain a tool_calls field — the
+// passthrough is strictly additive.
+func TestGetSession_ToolCallsPassthrough(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_tc','tool-call session','gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`)
+
+	// user → assistant tool-call-only → tool → assistant text answer.
+	// The first assistant row has empty content (the LLM only emitted
+	// tool_calls); the second carries the final text. Both should pair
+	// with the two llm_response events in order.
+	exec(`INSERT INTO messages VALUES ('sess_tc',1,'user','show me items','2024-03-01T10:00:00Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_tc',2,'assistant','','2024-03-01T10:00:01Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_tc',3,'tool','{"items":[]}','2024-03-01T10:00:02Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_tc',4,'assistant','No items found.','2024-03-01T10:00:03Z')`)
+
+	toolCallsPayload := `{"v":1,"raw_content_excerpt":"","tokens_in":50,"tokens_out":20,"cost_input":0,"cost_output":0,"native_tool_calls_raw":[{"id":"call_1","type":"function","function":{"name":"list-items","arguments":"{}"}}],"finish_reason":"tool_calls"}`
+	textOnlyPayload := `{"v":1,"raw_content_excerpt":"No items","tokens_in":80,"tokens_out":15,"cost_input":0,"cost_output":0,"finish_reason":"stop"}`
+	exec(`INSERT INTO session_events VALUES ('evt_tc1','sess_tc',1,'2024-03-01T10:00:00Z','llm_response',NULL,100,?,'2024-03-01T10:00:00Z')`,
+		toolCallsPayload)
+	exec(`INSERT INTO session_events VALUES ('evt_tc2','sess_tc',2,'2024-03-01T10:00:02Z','tool_call_result','evt_tc1',50,'{"v":1}','2024-03-01T10:00:02Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_tc3','sess_tc',3,'2024-03-01T10:00:03Z','llm_response',NULL,80,?,'2024-03-01T10:00:03Z')`,
+		textOnlyPayload)
+
+	w := do(t, h, "/sessions/sess_tc")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	if len(s.Messages) != 4 {
+		t.Fatalf("got %d messages, want 4", len(s.Messages))
+	}
+	if len(s.Messages[0].ToolCalls) != 0 {
+		t.Errorf("user row tool_calls = %s, want absent", s.Messages[0].ToolCalls)
+	}
+	tc := string(s.Messages[1].ToolCalls)
+	if !strings.Contains(tc, `"list-items"`) || !strings.Contains(tc, `"call_1"`) {
+		t.Errorf("tool-call assistant row tool_calls = %s, want raw native_tool_calls_raw passthrough", tc)
+	}
+	if len(s.Messages[2].ToolCalls) != 0 {
+		t.Errorf("tool row tool_calls = %s, want absent", s.Messages[2].ToolCalls)
+	}
+	if len(s.Messages[3].ToolCalls) != 0 {
+		t.Errorf("text-only assistant row tool_calls = %s, want absent (payload has no native_tool_calls_raw)", s.Messages[3].ToolCalls)
+	}
+
+	// omitempty contract: the JSON wire form has the key exactly once,
+	// on the tool-call assistant turn. Match `"tool_calls":` rather than
+	// the bare token — the event payload here contains `finish_reason:
+	// "tool_calls"` as a string value, which would otherwise inflate
+	// the count.
+	if n := strings.Count(w.Body.String(), `"tool_calls":`); n != 1 {
+		t.Errorf("tool_calls JSON key appears %d times, want 1 (only on the tool-call assistant turn); body = %s", n, w.Body.String())
+	}
+}
+
+// TestGetSession_EmptyToolCallsOmitted covers the two "no tool calls
+// were actually made" payload shapes — explicit null and explicit empty
+// array. Both must be treated as absent so the bubble UI doesn't render
+// "assistant invoked 0 tools" affordance on a plain text turn.
+func TestGetSession_EmptyToolCallsOmitted(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc','gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_empty_tc',1,'user','hi','2024-03-02T10:00:00Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_empty_tc',2,'assistant','hello','2024-03-02T10:00:01Z')`)
+	exec(`INSERT INTO messages VALUES ('sess_empty_tc',3,'assistant','again','2024-03-02T10:00:02Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_empty1','sess_empty_tc',1,'2024-03-02T10:00:00Z','llm_response',NULL,100,'{"v":1,"native_tool_calls_raw":null}','2024-03-02T10:00:00Z')`)
+	exec(`INSERT INTO session_events VALUES ('evt_empty2','sess_empty_tc',2,'2024-03-02T10:00:02Z','llm_response',NULL,100,'{"v":1,"native_tool_calls_raw":[]}','2024-03-02T10:00:02Z')`)
+
+	w := do(t, h, "/sessions/sess_empty_tc")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	for i, m := range s.Messages {
+		if len(m.ToolCalls) != 0 {
+			t.Errorf("messages[%d] (role=%s) tool_calls = %s, want absent for null/[] payload", i, m.Role, m.ToolCalls)
+		}
+	}
+	if n := strings.Count(w.Body.String(), `"tool_calls":`); n != 0 {
+		t.Errorf("tool_calls JSON key appears %d times, want 0; body = %s", n, w.Body.String())
+	}
+}
+
 func TestListEvents_FilterByType(t *testing.T) {
 	w := do(t, newTestHandler(t), "/events?event_type=tool_call_result")
 	var resp EventListResponse
