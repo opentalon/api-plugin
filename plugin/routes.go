@@ -42,6 +42,7 @@ func (h *Handler) routes() *http.ServeMux {
 	mux.HandleFunc("GET /health", h.handleHealth)
 	mux.HandleFunc("GET /sessions", h.handleListSessions)
 	mux.HandleFunc("GET /sessions/{id}", h.handleGetSession)
+	mux.HandleFunc("GET /sessions/{id}/events", h.handleSessionEvents)
 	mux.HandleFunc("GET /events", h.handleListEvents)
 	mux.HandleFunc("GET /events/stats", h.handleEventsStats)
 	mux.HandleFunc("GET /prompt-snapshots", h.handlePromptSnapshot)
@@ -164,6 +165,17 @@ type Event struct {
 type EventListResponse struct {
 	Items      []Event `json:"items"`
 	NextCursor string  `json:"next_cursor,omitempty"`
+}
+
+// SessionEventsResponse is the GET /sessions/{id}/events envelope —
+// purpose-built for the incremental tail-poll loop on Timly's
+// AI-Sessions diagnostic page. No next_cursor on this surface: `seq`
+// itself is the cursor, and the client passes max(items[].seq) as the
+// next ?since_seq. Reusing EventListResponse would publish a
+// next_cursor field we'd never populate; a separate envelope keeps the
+// contract unambiguous about cursor presence.
+type SessionEventsResponse struct {
+	Items []Event `json:"items"`
 }
 
 // EventStats is GET /events/stats — cross-session aggregates that mirror
@@ -388,6 +400,26 @@ func limitFromQuery(r *http.Request) (int, error) {
 	}
 	if v > maxLimit {
 		return 0, fmt.Errorf("limit: at most %d, got %d", maxLimit, v)
+	}
+	return v, nil
+}
+
+// sinceSeqFromQuery reads the optional `?since_seq=` cursor on the
+// tail-poll endpoint. Empty → 0 (return full session). Anything else
+// must parse as a non-negative integer; a negative value is a client
+// bug (seq is per-session and starts at 1, so seq > -N would over-fetch
+// nothing and waste the round-trip's correctness invariant).
+func sinceSeqFromQuery(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("since_seq")
+	if raw == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("since_seq: must be an integer, got %q", raw)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("since_seq: must be non-negative, got %d", v)
 	}
 	return v, nil
 }
@@ -844,6 +876,57 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, sess)
+}
+
+// handleSessionEvents is the incremental tail-poll endpoint used by
+// Timly's AI-Sessions diagnostic page (issue #17). Designed for a 2s
+// polling loop after an initial GET /sessions/{id} envelope fetch:
+// returns events with seq > since_seq in ascending seq order so the
+// client appends directly to its rendered log.
+//
+// Cursor is `seq` itself — no opaque token, no encode/decode. The
+// session-events table's UNIQUE (session_id, seq) index backs both the
+// per-session monotonic gap-free seq guarantee (writer side, retry on
+// conflict in opentalon-core) and the ORDER BY here on the read side.
+//
+// 404 is a separate cheap PK probe so empty `items` (caught-up poll)
+// is disambiguated from "session was deleted mid-loop". Polling clients
+// stop on 404; on an empty `items` they keep polling at the same cadence.
+func (h *Handler) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("id")
+
+	sinceSeq, err := sinceSeqFromQuery(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit, err := limitFromQuery(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	includePayload, err := boolFromQuery(r, "include_payload", true)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	exists, err := sessionExists(h.db, h.dialect, sessionID)
+	if err != nil {
+		writeServerErr(w, r, "/sessions/{id}/events", err)
+		return
+	}
+	if !exists {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	items, err := listSessionEventsAsc(h.db, h.dialect, sessionID, sinceSeq, includePayload, limit)
+	if err != nil {
+		writeServerErr(w, r, "/sessions/{id}/events", err)
+		return
+	}
+	writeJSON(w, SessionEventsResponse{Items: items})
 }
 
 func (h *Handler) handleListEvents(w http.ResponseWriter, r *http.Request) {
@@ -1424,6 +1507,76 @@ func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {
 		return nil, fmt.Errorf("sessionMessages rows: %w", err)
 	}
 	return msgs, nil
+}
+
+// sessionExists is the 404-probe for handleSessionEvents — a separate
+// indexed PK lookup so the polling endpoint can distinguish "session
+// was deleted mid-loop" (404) from "session is caught up" (200 with
+// empty items). Combining the probe with the events SELECT would force
+// a LEFT JOIN or a follow-up "did we get nothing because nothing
+// matched or because the session is gone" branch; the dedicated probe
+// is one sub-ms PK lookup and stays trivially correct.
+func sessionExists(db *sql.DB, d Dialect, id string) (bool, error) {
+	var n int
+	err := db.QueryRow(d.Rebind(`SELECT 1 FROM sessions WHERE id = ?`), id).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("sessionExists: %w", err)
+	}
+	return true, nil
+}
+
+// listSessionEventsAsc is the tail-poll read. Single indexed range-scan
+// over (session_id, seq) — same index that backs the writer-side
+// gap-free seq invariant in opentalon-core. ORDER BY seq is served
+// directly from the index (no filesort) and LIMIT clips to one bounded
+// page, so the request cost is independent of total session length.
+//
+// `include_payload=false` drops the payload column entirely from the
+// scan rather than nil-ing it post-fetch, so a session with multi-MB
+// rows can still be tail-polled cheaply for the structural log.
+func listSessionEventsAsc(db *sql.DB, d Dialect, sessionID string, sinceSeq int, includePayload bool, limit int) ([]Event, error) {
+	var q strings.Builder
+	q.WriteString(`SELECT se.id, se.session_id, se.seq, se.ts, se.event_type,
+		COALESCE(se.parent_id,''), COALESCE(se.duration_ms,0)`)
+	if includePayload {
+		q.WriteString(`, se.payload`)
+	}
+	q.WriteString(` FROM session_events se
+		WHERE se.session_id = ? AND se.seq > ?
+		ORDER BY se.seq
+		LIMIT ?`)
+
+	rows, err := db.Query(d.Rebind(q.String()), sessionID, sinceSeq, limit)
+	if err != nil {
+		return nil, fmt.Errorf("listSessionEventsAsc: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	items := make([]Event, 0, limit)
+	for rows.Next() {
+		var e Event
+		var payload string
+		if includePayload {
+			if err := rows.Scan(&e.ID, &e.SessionID, &e.Seq, &e.TS, &e.EventType,
+				&e.ParentID, &e.DurationMS, &payload); err != nil {
+				return nil, fmt.Errorf("listSessionEventsAsc scan (payload): %w", err)
+			}
+			e.Payload = json.RawMessage(payload)
+		} else {
+			if err := rows.Scan(&e.ID, &e.SessionID, &e.Seq, &e.TS, &e.EventType,
+				&e.ParentID, &e.DurationMS); err != nil {
+				return nil, fmt.Errorf("listSessionEventsAsc scan: %w", err)
+			}
+		}
+		items = append(items, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listSessionEventsAsc rows: %w", err)
+	}
+	return items, nil
 }
 
 func sessionEvents(db *sql.DB, d Dialect, id string) ([]Event, error) {

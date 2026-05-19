@@ -48,6 +48,12 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			payload TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+		// Mirrors opentalon migration 009_session_events.sql:43 — the
+		// composite index that backs both the writer-side gap-free seq
+		// invariant AND the index-served ORDER BY seq on
+		// /sessions/{id}/events. Without it, the tail-poll perf claim
+		// ("one indexed range-scan, no filesort") is untested.
+		`CREATE UNIQUE INDEX idx_session_events_session_seq ON session_events(session_id, seq)`,
 		`CREATE TABLE prompt_snapshots (
 			sha256 TEXT PRIMARY KEY,
 			kind TEXT NOT NULL,
@@ -2605,4 +2611,263 @@ func TestListEvents_BadCursor(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "cursor") {
 		t.Errorf("body should mention cursor, got %s", w.Body.String())
 	}
+}
+
+// --- GET /sessions/{id}/events — incremental tail polling (issue #17) ---
+//
+// Tail-poll endpoint contract: ascending seq order, seq itself is the
+// cursor, idempotent overshoot, no filters, no next_cursor field. The
+// tests below pin every clause of that contract — particularly the
+// caught-up vs deleted distinction (200 empty vs 404) and the "no
+// next_cursor field" negative assertion which locks the response shape.
+
+// Happy path: since_seq=0 (default) returns the whole session in seq ASC.
+func TestSessionEvents_HappyPathReturnsAllInSeqAsc(t *testing.T) {
+	h := newTestHandler(t)
+	w := do(t, h, "/sessions/sess_a/events")
+	mustStatus(t, w, http.StatusOK)
+
+	var resp SessionEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 2 {
+		t.Fatalf("got %d items, want 2; body = %s", len(resp.Items), w.Body.String())
+	}
+	if resp.Items[0].Seq != 1 || resp.Items[1].Seq != 2 {
+		t.Errorf("seqs = [%d %d], want [1 2] (ASC)", resp.Items[0].Seq, resp.Items[1].Seq)
+	}
+	if resp.Items[0].ID != "evt_a1" || resp.Items[1].ID != "evt_a2" {
+		t.Errorf("ids = [%q %q], want [evt_a1 evt_a2]", resp.Items[0].ID, resp.Items[1].ID)
+	}
+}
+
+// Mid-tail: since_seq=1 trims the already-seen prefix.
+func TestSessionEvents_MidTailTrimsSeenPrefix(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/events?since_seq=1")
+	mustStatus(t, w, http.StatusOK)
+
+	var resp SessionEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].Seq != 2 {
+		t.Errorf("got %+v, want one item with seq=2", seqsOf(resp.Items))
+	}
+}
+
+// Caught up: since_seq == max(seq) returns empty `items` with 200 — the
+// polling client keeps polling, no state-resync.
+func TestSessionEvents_CaughtUpReturns200WithEmptyItems(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/events?since_seq=2")
+	mustStatus(t, w, http.StatusOK)
+
+	var resp SessionEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 0 {
+		t.Errorf("got %d items, want 0 (caught up)", len(resp.Items))
+	}
+	// Empty array, not null, so the consumer's `items.length` works
+	// without a null-guard.
+	if !strings.Contains(w.Body.String(), `"items":[]`) {
+		t.Errorf("body should serialise empty items as `[]`, got %s", w.Body.String())
+	}
+}
+
+// Idempotent overshoot: since_seq > max(seq) returns empty, NOT 404.
+// Locks the "session exists but I overshot" branch — critical because
+// 404 forces the client to stop polling.
+func TestSessionEvents_OvershootIsIdempotent200(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/events?since_seq=99")
+	mustStatus(t, w, http.StatusOK)
+
+	var resp SessionEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 0 {
+		t.Errorf("got %d items, want 0 (overshoot)", len(resp.Items))
+	}
+}
+
+// Session boundary: polling sess_a never returns sess_b's events even
+// though both sessions reuse seq=[1,2]. Locks the WHERE session_id = ?
+// clause — without it the UNIQUE (session_id, seq) range-scan would
+// over-fetch on the seq predicate alone.
+func TestSessionEvents_SessionBoundaryNoCrossLeak(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/events")
+	mustStatus(t, w, http.StatusOK)
+	var resp SessionEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	for _, e := range resp.Items {
+		if e.SessionID != "sess_a" {
+			t.Errorf("got event with session_id=%q, want sess_a only", e.SessionID)
+		}
+	}
+}
+
+// Unknown session id → 404 (matches GET /sessions/{id}).
+func TestSessionEvents_UnknownSessionReturns404(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_does_not_exist/events")
+	mustStatus(t, w, http.StatusNotFound)
+	if !strings.Contains(w.Body.String(), "session not found") {
+		t.Errorf("body should say session not found, got %s", w.Body.String())
+	}
+}
+
+// 400 on bad since_seq: non-integer and negative both rejected. Negative
+// is rejected explicitly (would over-fetch unsafely vs the seq>=1 invariant).
+func TestSessionEvents_BadSinceSeqReturns400(t *testing.T) {
+	h := newTestHandler(t)
+	for _, target := range []string{
+		"/sessions/sess_a/events?since_seq=banana",
+		"/sessions/sess_a/events?since_seq=-1",
+		"/sessions/sess_a/events?since_seq=1.5",
+	} {
+		w := do(t, h, target)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body = %s", target, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "since_seq") {
+			t.Errorf("%s: error body should name since_seq, got %s", target, w.Body.String())
+		}
+	}
+}
+
+// 400 on bad limit: delegates to limitFromQuery — single sanity case here,
+// the strict-bounds matrix lives on TestLimitValidation_StrictOnAllBounds.
+// We also guard 404-vs-400 ordering: an invalid limit on an unknown
+// session must still 400 (param validation before session-existence
+// probe) so the client surfaces the consumer bug instead of being told
+// the session is missing.
+func TestSessionEvents_BadLimitReturns400(t *testing.T) {
+	h := newTestHandler(t)
+
+	w := do(t, h, "/sessions/sess_a/events?limit=0")
+	mustStatus(t, w, http.StatusBadRequest)
+	if !strings.Contains(w.Body.String(), "limit") {
+		t.Errorf("body should name limit, got %s", w.Body.String())
+	}
+
+	// Invalid limit + unknown session: 400 wins (param validation first).
+	w = do(t, h, "/sessions/sess_does_not_exist/events?limit=banana")
+	mustStatus(t, w, http.StatusBadRequest)
+}
+
+// 400 on bad include_payload: reuses boolFromQuery's strict parser.
+func TestSessionEvents_BadIncludePayloadReturns400(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/events?include_payload=banana")
+	mustStatus(t, w, http.StatusBadRequest)
+	if !strings.Contains(w.Body.String(), "include_payload") {
+		t.Errorf("body should name include_payload, got %s", w.Body.String())
+	}
+}
+
+// include_payload=false omits the payload field from each item. Mirrors
+// the contract on /events so a noisy session can be tail-polled cheaply
+// for the structural log alone.
+func TestSessionEvents_IncludePayloadFalseOmitsPayload(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/events?include_payload=false")
+	mustStatus(t, w, http.StatusOK)
+
+	// Negative JSON assertion — Event.Payload uses omitempty, so the key
+	// disappears entirely when payload is empty.
+	if strings.Contains(w.Body.String(), `"payload"`) {
+		t.Errorf("payload key should be absent when include_payload=false; body = %s", w.Body.String())
+	}
+}
+
+// Limit boundary: with N > limit events, the first `limit` rows come back
+// in seq order, and max(items[].seq) is what the client should pass as the
+// next since_seq. Also pins the ordering invariant (strictly ascending).
+//
+// Burst contract: items.length == limit signals the client to poll
+// immediately again (skip the 2s wait) until items.length drops below
+// limit. This test just exercises the first burst; the client-side
+// loop is the consumer's responsibility.
+func TestSessionEvents_LimitBoundaryAndBurstSemantics(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	exec(`INSERT INTO sessions VALUES ('sess_burst','burst','gpt-4o','{}','user_b','group_b','2024-05-19T00:00:00Z','2024-05-19T00:00:30Z')`)
+	// Seed 30 events with seq=1..30. Insert in a non-sorted order to
+	// ensure the ORDER BY clause is doing the work, not the insertion order.
+	insertOrder := []int{15, 7, 1, 22, 30, 14, 3, 18, 9, 26, 5, 12, 20, 28, 2, 17, 24, 8, 19, 4, 21, 11, 27, 6, 13, 25, 10, 16, 29, 23}
+	for _, n := range insertOrder {
+		exec(`INSERT INTO session_events VALUES (?,?,?,?,?,NULL,0,?,?)`,
+			fmt.Sprintf("evt_burst_%02d", n), "sess_burst", n,
+			fmt.Sprintf("2024-05-19T00:00:%02dZ", n%60), "llm_response",
+			`{"v":1}`, "2024-05-19T00:00:00Z")
+	}
+
+	// First poll: default limit=25, should return seq=1..25.
+	w := do(t, h, "/sessions/sess_burst/events")
+	mustStatus(t, w, http.StatusOK)
+	var resp SessionEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 25 {
+		t.Fatalf("page 1: got %d items, want 25 (default limit)", len(resp.Items))
+	}
+	// Ordering invariant.
+	for i := 0; i < len(resp.Items)-1; i++ {
+		if resp.Items[i].Seq >= resp.Items[i+1].Seq {
+			t.Errorf("page 1 not strictly ASC at index %d: %d >= %d",
+				i, resp.Items[i].Seq, resp.Items[i+1].Seq)
+		}
+	}
+	if resp.Items[0].Seq != 1 || resp.Items[24].Seq != 25 {
+		t.Errorf("page 1: seq range = [%d..%d], want [1..25]", resp.Items[0].Seq, resp.Items[24].Seq)
+	}
+
+	// Burst follow-up: cursor = max(items[].seq) = 25. Should drain the rest.
+	maxSeq := resp.Items[len(resp.Items)-1].Seq
+	w = do(t, h, fmt.Sprintf("/sessions/sess_burst/events?since_seq=%d", maxSeq))
+	mustStatus(t, w, http.StatusOK)
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 5 {
+		t.Fatalf("page 2: got %d items, want 5", len(resp.Items))
+	}
+	if resp.Items[0].Seq != 26 || resp.Items[4].Seq != 30 {
+		t.Errorf("page 2: seq range = [%d..%d], want [26..30]",
+			resp.Items[0].Seq, resp.Items[4].Seq)
+	}
+}
+
+// No `next_cursor` field on the wire — negative assertion that locks
+// the response contract. The seq value is the cursor; an opaque token
+// would invite consumers to round-trip something we control.
+func TestSessionEvents_ResponseHasNoNextCursorField(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/events")
+	mustStatus(t, w, http.StatusOK)
+	if strings.Contains(w.Body.String(), "next_cursor") {
+		t.Errorf("response must not contain next_cursor (seq is the cursor); body = %s", w.Body.String())
+	}
+}
+
+// DB-error path: closing the DB before the handler runs forces the 404
+// probe to error; the response must be 500 with a generic message, not
+// leak the DB-internal text. Mirrors TestGetSession_DBError.
+func TestSessionEvents_DBError(t *testing.T) {
+	h := newTestHandler(t)
+	_ = h.db.Close()
+	w := do(t, h, "/sessions/sess_a/events")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "internal server error") {
+		t.Errorf("body should contain generic 'internal server error', got %s", w.Body.String())
+	}
+	for _, leak := range []string{"sql:", "sqlite", "database is closed"} {
+		if strings.Contains(w.Body.String(), leak) {
+			t.Errorf("body leaks internal error detail %q: %s", leak, w.Body.String())
+		}
+	}
+}
+
+// seqsOf is a small debug helper used by the tail-poll tests to render
+// the seq list cleanly in failure messages.
+func seqsOf(items []Event) []int {
+	out := make([]int, len(items))
+	for i, e := range items {
+		out[i] = e.Seq
+	}
+	return out
 }
