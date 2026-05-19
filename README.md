@@ -12,6 +12,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 | GET | `/health` | Liveness + DB ping |
 | GET | `/sessions` | Paginated session list, each row with its own JIT-aggregated `stats`, plus `totals` over the full filtered set |
 | GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats` |
+| GET | `/sessions/{id}/events` | Incremental tail-poll for one session — events with `seq > since_seq` in ASC order, designed for a 2 s polling loop after the initial `/sessions/{id}` envelope fetch |
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
 | GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions` plus optional `event_type` exact-match, optional `group_by=event_type` + `sample_sessions=N`, optional `bucket_by=day/week/month/year` for time-series |
 | GET | `/prompt-snapshots?sha=...` | Resolve a prompt body by sha256 (referenced from `turn_start` events) |
@@ -61,6 +62,34 @@ The cursor format extends to four fields — `<sort>|<direction>|<value>|<id>`, 
 ### Pagination
 
 `/sessions` and `/events` use composite cursor pagination on `(sort-key-value, id)`. The response carries `next_cursor` (an opaque base64url blob); pass it back as `?cursor=...` to fetch the next page. Empty `next_cursor` means last page.
+
+### Tail polling — `/sessions/{id}/events`
+
+Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after an initial `GET /sessions/{id}` envelope fetch, the consumer polls this endpoint on a ~2 s cadence to receive events as they're written.
+
+- `since_seq=N` (default `0`) — returns events with `seq > N` in **ascending seq order** (oldest → newest). Append directly to the rendered log.
+- `limit` — standard limit clamp (default 25, max 200; out-of-bounds → 400).
+- `include_payload` — same `true`/`false` semantics as `/events`.
+
+**Cursor is `seq` itself.** No opaque token, no `next_cursor` field on this surface. The client tracks `max(items[].seq)` from each response and passes it as the next `since_seq`. The (`session_id`, `seq`) unique index in opentalon-core guarantees per-session monotonic, gap-free seq starting at 1 — once a client has seen seq=N, no event with `seq < N` will appear in any future poll for that session.
+
+**Burst handling.** If `items.length === limit`, immediately re-poll with the new `since_seq` (skip the regular interval). Repeat until `items.length < limit`, then resume the normal 2 s cadence.
+
+**Idempotent overshoot.** A `since_seq` ≥ `max(seq)` returns `{"items":[]}` (HTTP 200), not 404. Clients can re-poll without state-resync. 404 is reserved for "the session was deleted mid-loop" — that's the signal to stop polling.
+
+**No filters.** No `event_type` / `since` / `until` on this endpoint — filter misses would scan repeatedly without advancing the cursor. Use `GET /events` for analytical queries.
+
+```jsonc
+// GET /sessions/sess_a/events?since_seq=42
+{
+  "items": [
+    { "id": "evt_x", "session_id": "sess_a", "seq": 43, "ts": "...",
+      "event_type": "tool_call_result", "duration_ms": 50, "payload": {…} },
+    { "id": "evt_y", "session_id": "sess_a", "seq": 44, "ts": "...",
+      "event_type": "llm_response", "duration_ms": 312, "payload": {…} }
+  ]
+}
+```
 
 ### Response shape
 
@@ -243,6 +272,10 @@ curl -s -H "Authorization: Bearer your-secret-token" \
 # All llm_response events in a session, payload-light
 curl -s -H "Authorization: Bearer your-secret-token" \
   'https://opentalon.example.com/api/events?session_id=sess_a&event_type=llm_response&include_payload=false'
+
+# Tail-poll a session's events incrementally (resume after seq=42)
+curl -s -H "Authorization: Bearer your-secret-token" \
+  'https://opentalon.example.com/api/sessions/sess_a/events?since_seq=42'
 ```
 
 ## Build
