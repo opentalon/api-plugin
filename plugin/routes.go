@@ -167,13 +167,11 @@ type EventListResponse struct {
 	NextCursor string  `json:"next_cursor,omitempty"`
 }
 
-// SessionEventsResponse is the GET /sessions/{id}/events envelope —
-// purpose-built for the incremental tail-poll loop on Timly's
-// AI-Sessions diagnostic page. No next_cursor on this surface: `seq`
-// itself is the cursor, and the client passes max(items[].seq) as the
-// next ?since_seq. Reusing EventListResponse would publish a
-// next_cursor field we'd never populate; a separate envelope keeps the
-// contract unambiguous about cursor presence.
+// SessionEventsResponse is the GET /sessions/{id}/events envelope. No
+// next_cursor field: `seq` itself is the cursor — the client passes
+// max(items[].seq) as the next ?since_seq. A separate type (vs reusing
+// EventListResponse with NextCursor + omitempty) keeps the contract
+// unambiguous about cursor presence.
 type SessionEventsResponse struct {
 	Items []Event `json:"items"`
 }
@@ -405,10 +403,10 @@ func limitFromQuery(r *http.Request) (int, error) {
 }
 
 // sinceSeqFromQuery reads the optional `?since_seq=` cursor on the
-// tail-poll endpoint. Empty → 0 (return full session). Anything else
-// must parse as a non-negative integer; a negative value is a client
-// bug (seq is per-session and starts at 1, so seq > -N would over-fetch
-// nothing and waste the round-trip's correctness invariant).
+// tail-poll endpoint. Empty → 0 (full session). Negative values are
+// rejected: seq starts at 1, so `seq > -N` would match every row in
+// the session on every poll — quietly turning the tail-poll into a
+// full re-fetch.
 func sinceSeqFromQuery(r *http.Request) (int, error) {
 	raw := r.URL.Query().Get("since_seq")
 	if raw == "" {
@@ -878,20 +876,22 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, sess)
 }
 
-// handleSessionEvents is the incremental tail-poll endpoint used by
-// Timly's AI-Sessions diagnostic page (issue #17). Designed for a 2s
-// polling loop after an initial GET /sessions/{id} envelope fetch:
-// returns events with seq > since_seq in ascending seq order so the
-// client appends directly to its rendered log.
+// handleSessionEvents is the incremental tail-poll endpoint for the
+// AI-Sessions diagnostic page. Returns events with seq > since_seq in
+// ascending seq order so the client appends directly to its rendered
+// log; designed for a 2s polling loop after an initial GET
+// /sessions/{id} envelope fetch.
 //
 // Cursor is `seq` itself — no opaque token, no encode/decode. The
-// session-events table's UNIQUE (session_id, seq) index backs both the
-// per-session monotonic gap-free seq guarantee (writer side, retry on
-// conflict in opentalon-core) and the ORDER BY here on the read side.
+// UNIQUE (session_id, seq) index backs both the per-session monotonic
+// gap-free seq guarantee (writer side, retry-on-conflict in
+// opentalon-core) and the ORDER BY here on the read side.
 //
 // 404 is a separate cheap PK probe so empty `items` (caught-up poll)
-// is disambiguated from "session was deleted mid-loop". Polling clients
-// stop on 404; on an empty `items` they keep polling at the same cadence.
+// is disambiguated from an unknown session id. Sessions are
+// append-only in this system, so 404 means "id never existed"
+// (typo / probe); polling clients stop. On an empty `items` they keep
+// polling at the same cadence.
 func (h *Handler) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
 
@@ -1510,12 +1510,12 @@ func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {
 }
 
 // sessionExists is the 404-probe for handleSessionEvents — a separate
-// indexed PK lookup so the polling endpoint can distinguish "session
-// was deleted mid-loop" (404) from "session is caught up" (200 with
-// empty items). Combining the probe with the events SELECT would force
-// a LEFT JOIN or a follow-up "did we get nothing because nothing
-// matched or because the session is gone" branch; the dedicated probe
-// is one sub-ms PK lookup and stays trivially correct.
+// indexed PK lookup so the polling endpoint can distinguish an
+// unknown session id (404) from a caught-up poll (200 with empty
+// items). Combining the probe with the events SELECT would force a
+// LEFT JOIN or a follow-up "did we get nothing because nothing
+// matched or because the session doesn't exist" branch; the dedicated
+// probe is one sub-ms PK lookup and stays trivially correct.
 func sessionExists(db *sql.DB, d Dialect, id string) (bool, error) {
 	var n int
 	err := db.QueryRow(d.Rebind(`SELECT 1 FROM sessions WHERE id = ?`), id).Scan(&n)

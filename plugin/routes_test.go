@@ -2613,15 +2613,14 @@ func TestListEvents_BadCursor(t *testing.T) {
 	}
 }
 
-// --- GET /sessions/{id}/events — incremental tail polling (issue #17) ---
+// --- GET /sessions/{id}/events — incremental tail polling ---
 //
 // Tail-poll endpoint contract: ascending seq order, seq itself is the
 // cursor, idempotent overshoot, no filters, no next_cursor field. The
 // tests below pin every clause of that contract — particularly the
-// caught-up vs deleted distinction (200 empty vs 404) and the "no
+// caught-up vs unknown-id distinction (200 empty vs 404) and the "no
 // next_cursor field" negative assertion which locks the response shape.
 
-// Happy path: since_seq=0 (default) returns the whole session in seq ASC.
 func TestSessionEvents_HappyPathReturnsAllInSeqAsc(t *testing.T) {
 	h := newTestHandler(t)
 	w := do(t, h, "/sessions/sess_a/events")
@@ -2640,7 +2639,6 @@ func TestSessionEvents_HappyPathReturnsAllInSeqAsc(t *testing.T) {
 	}
 }
 
-// Mid-tail: since_seq=1 trims the already-seen prefix.
 func TestSessionEvents_MidTailTrimsSeenPrefix(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_a/events?since_seq=1")
 	mustStatus(t, w, http.StatusOK)
@@ -2652,8 +2650,8 @@ func TestSessionEvents_MidTailTrimsSeenPrefix(t *testing.T) {
 	}
 }
 
-// Caught up: since_seq == max(seq) returns empty `items` with 200 — the
-// polling client keeps polling, no state-resync.
+// Caught-up poll keeps polling rather than resyncing — 200 with empty
+// items, not 404. Critical for the 2s loop to survive idle gaps.
 func TestSessionEvents_CaughtUpReturns200WithEmptyItems(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_a/events?since_seq=2")
 	mustStatus(t, w, http.StatusOK)
@@ -2670,9 +2668,8 @@ func TestSessionEvents_CaughtUpReturns200WithEmptyItems(t *testing.T) {
 	}
 }
 
-// Idempotent overshoot: since_seq > max(seq) returns empty, NOT 404.
-// Locks the "session exists but I overshot" branch — critical because
-// 404 forces the client to stop polling.
+// since_seq > max(seq) must NOT 404 — 404 means "stop polling", and the
+// caller should be allowed to re-poll a stale cursor without resync.
 func TestSessionEvents_OvershootIsIdempotent200(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_a/events?since_seq=99")
 	mustStatus(t, w, http.StatusOK)
@@ -2684,10 +2681,8 @@ func TestSessionEvents_OvershootIsIdempotent200(t *testing.T) {
 	}
 }
 
-// Session boundary: polling sess_a never returns sess_b's events even
-// though both sessions reuse seq=[1,2]. Locks the WHERE session_id = ?
-// clause — without it the UNIQUE (session_id, seq) range-scan would
-// over-fetch on the seq predicate alone.
+// Both sessions reuse seq=[1,2], so dropping the `WHERE session_id = ?`
+// clause would still pass a happy-path test — this one would catch it.
 func TestSessionEvents_SessionBoundaryNoCrossLeak(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_a/events")
 	mustStatus(t, w, http.StatusOK)
@@ -2700,7 +2695,6 @@ func TestSessionEvents_SessionBoundaryNoCrossLeak(t *testing.T) {
 	}
 }
 
-// Unknown session id → 404 (matches GET /sessions/{id}).
 func TestSessionEvents_UnknownSessionReturns404(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_does_not_exist/events")
 	mustStatus(t, w, http.StatusNotFound)
@@ -2709,8 +2703,6 @@ func TestSessionEvents_UnknownSessionReturns404(t *testing.T) {
 	}
 }
 
-// 400 on bad since_seq: non-integer and negative both rejected. Negative
-// is rejected explicitly (would over-fetch unsafely vs the seq>=1 invariant).
 func TestSessionEvents_BadSinceSeqReturns400(t *testing.T) {
 	h := newTestHandler(t)
 	for _, target := range []string{
@@ -2728,12 +2720,9 @@ func TestSessionEvents_BadSinceSeqReturns400(t *testing.T) {
 	}
 }
 
-// 400 on bad limit: delegates to limitFromQuery — single sanity case here,
-// the strict-bounds matrix lives on TestLimitValidation_StrictOnAllBounds.
-// We also guard 404-vs-400 ordering: an invalid limit on an unknown
-// session must still 400 (param validation before session-existence
-// probe) so the client surfaces the consumer bug instead of being told
-// the session is missing.
+// Param validation must run before the session-existence probe — an
+// invalid limit on an unknown session must still 400 (not 404) so the
+// client sees the consumer bug, not a misleading "missing session".
 func TestSessionEvents_BadLimitReturns400(t *testing.T) {
 	h := newTestHandler(t)
 
@@ -2743,12 +2732,10 @@ func TestSessionEvents_BadLimitReturns400(t *testing.T) {
 		t.Errorf("body should name limit, got %s", w.Body.String())
 	}
 
-	// Invalid limit + unknown session: 400 wins (param validation first).
 	w = do(t, h, "/sessions/sess_does_not_exist/events?limit=banana")
 	mustStatus(t, w, http.StatusBadRequest)
 }
 
-// 400 on bad include_payload: reuses boolFromQuery's strict parser.
 func TestSessionEvents_BadIncludePayloadReturns400(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_a/events?include_payload=banana")
 	mustStatus(t, w, http.StatusBadRequest)
@@ -2757,9 +2744,6 @@ func TestSessionEvents_BadIncludePayloadReturns400(t *testing.T) {
 	}
 }
 
-// include_payload=false omits the payload field from each item. Mirrors
-// the contract on /events so a noisy session can be tail-polled cheaply
-// for the structural log alone.
 func TestSessionEvents_IncludePayloadFalseOmitsPayload(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_a/events?include_payload=false")
 	mustStatus(t, w, http.StatusOK)
@@ -2771,14 +2755,9 @@ func TestSessionEvents_IncludePayloadFalseOmitsPayload(t *testing.T) {
 	}
 }
 
-// Limit boundary: with N > limit events, the first `limit` rows come back
-// in seq order, and max(items[].seq) is what the client should pass as the
-// next since_seq. Also pins the ordering invariant (strictly ascending).
-//
-// Burst contract: items.length == limit signals the client to poll
-// immediately again (skip the 2s wait) until items.length drops below
-// limit. This test just exercises the first burst; the client-side
-// loop is the consumer's responsibility.
+// items.length == limit is the burst signal: the client polls again
+// immediately (skip the 2s wait) until the result drops below limit.
+// This test exercises one burst round-trip; the loop is consumer-side.
 func TestSessionEvents_LimitBoundaryAndBurstSemantics(t *testing.T) {
 	h := newTestHandler(t)
 	exec := func(q string, args ...any) {
@@ -2831,9 +2810,8 @@ func TestSessionEvents_LimitBoundaryAndBurstSemantics(t *testing.T) {
 	}
 }
 
-// No `next_cursor` field on the wire — negative assertion that locks
-// the response contract. The seq value is the cursor; an opaque token
-// would invite consumers to round-trip something we control.
+// Negative wire-assertion: no next_cursor field. seq is the cursor;
+// an opaque token would invite consumers to round-trip one.
 func TestSessionEvents_ResponseHasNoNextCursorField(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/sess_a/events")
 	mustStatus(t, w, http.StatusOK)
@@ -2842,9 +2820,7 @@ func TestSessionEvents_ResponseHasNoNextCursorField(t *testing.T) {
 	}
 }
 
-// DB-error path: closing the DB before the handler runs forces the 404
-// probe to error; the response must be 500 with a generic message, not
-// leak the DB-internal text. Mirrors TestGetSession_DBError.
+// 500 must not leak DB-internal text. Mirrors TestGetSession_DBError.
 func TestSessionEvents_DBError(t *testing.T) {
 	h := newTestHandler(t)
 	_ = h.db.Close()
@@ -2862,8 +2838,6 @@ func TestSessionEvents_DBError(t *testing.T) {
 	}
 }
 
-// seqsOf is a small debug helper used by the tail-poll tests to render
-// the seq list cleanly in failure messages.
 func seqsOf(items []Event) []int {
 	out := make([]int, len(items))
 	for i, e := range items {
