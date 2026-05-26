@@ -54,7 +54,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 
 `/sessions` accepts `sort` + `direction` for analytics use cases ("top N sessions by cost", "highest tool-call counts"). Defaults preserve the pre-#8 contract.
 
-- `sort` (default `created_at`) — one of: `created_at`, `cost_total`, `llm_call_count`, `tool_call_count`, `tokens_in_total`, `tokens_out_total`. `cost_total` is `cost_input_total + cost_output_total`.
+- `sort` (default `created_at`) — one of: `created_at`, `updated_at`, `cost_total`, `llm_call_count`, `tool_call_count`, `tokens_in_total`, `tokens_out_total`. `cost_total` is `cost_input_total + cost_output_total`. `updated_at` exists for the session-picker case ("most recently active sessions"), separate from creation time.
 - `direction` (default `desc`) — `asc` or `desc`.
 
 The cursor format extends to four fields — `<sort>|<direction>|<value>|<id>`, base64url-encoded — so the active sort identifier travels with the boundary. Replaying a cursor under a different `sort`/`direction` returns 400 ("cursor sort mismatch") rather than walking a meaningless keyset. Legacy two-field cursors (`<value>|<id>`) minted before this feature are accepted under the default sort for back-compat.
@@ -101,6 +101,7 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
       "id": "...",
       "entity_id": "user_1",
       "group_id": "group_x",
+      "title": "Reset forgotten password",  // omitted until opentalon-core's title-generation pass populates it (typically after the first assistant turn)
       "summary": "...",
       "active_model": "gpt-4o",
       "created_at": "...",

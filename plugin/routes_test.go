@@ -28,6 +28,7 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 		`CREATE TABLE sessions (
 			id TEXT PRIMARY KEY,
 			summary TEXT,
+			title TEXT,
 			active_model TEXT,
 			metadata TEXT,
 			entity_id TEXT DEFAULT '',
@@ -77,8 +78,8 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 	// with priced payloads; Session B (newer) has 1 llm_response + 1
 	// tool_call_result. Time stamps are chosen so created_at DESC gives B
 	// first and the cursor test below can walk forward into A.
-	exec(`INSERT INTO sessions VALUES ('sess_a','first session','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z')`)
-	exec(`INSERT INTO sessions VALUES ('sess_b','second session','gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_a','first session','First chat title','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_b','second session',NULL,'gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z')`)
 
 	exec(`INSERT INTO messages VALUES ('sess_a',1,'user','hi','2024-01-01T10:00:00Z')`)
 	exec(`INSERT INTO messages VALUES ('sess_a',2,'assistant','hello','2024-01-01T10:00:01Z')`)
@@ -765,6 +766,79 @@ func TestGetSession_FullDetail(t *testing.T) {
 	}
 }
 
+func TestListSessions_TitleRoundTrip(t *testing.T) {
+	// sess_a has a populated title; sess_b has NULL — the response must
+	// echo the populated string and omit the field for the NULL row so
+	// pre-generation sessions don't render an empty bubble.
+	w := do(t, newTestHandler(t), "/sessions")
+	mustStatus(t, w, http.StatusOK)
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(resp.Items))
+	}
+	// Default sort is created_at DESC → sess_b (Feb) first, sess_a (Jan) second.
+	if resp.Items[0].ID != "sess_b" || resp.Items[0].Title != "" {
+		t.Errorf("sess_b.Title = %q, want empty (NULL in DB)", resp.Items[0].Title)
+	}
+	if resp.Items[1].ID != "sess_a" || resp.Items[1].Title != "First chat title" {
+		t.Errorf("sess_a.Title = %q, want %q", resp.Items[1].Title, "First chat title")
+	}
+	// JSON envelope: title field absent when empty (omitempty on the
+	// struct tag). Walk the raw bytes so this catches accidental "":"
+	// renderings if someone removes omitempty later.
+	if strings.Contains(w.Body.String(), `"id":"sess_b"`) &&
+		strings.Contains(w.Body.String(), `"id":"sess_b","entity_id":"user_2","group_id":"group_y","title":""`) {
+		t.Errorf("empty title rendered as \"\" instead of being omitted: %s", w.Body.String())
+	}
+}
+
+func TestGetSession_TitleRoundTrip(t *testing.T) {
+	// Mirrors the list test on the detail endpoint so consumers can pick
+	// either entry point.
+	w := do(t, newTestHandler(t), "/sessions/sess_a")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+	if s.Title != "First chat title" {
+		t.Errorf("Title = %q, want %q", s.Title, "First chat title")
+	}
+
+	w2 := do(t, newTestHandler(t), "/sessions/sess_b")
+	mustStatus(t, w2, http.StatusOK)
+	var s2 SessionDetail
+	mustUnmarshal(t, w2.Body.Bytes(), &s2)
+	if s2.Title != "" {
+		t.Errorf("sess_b Title = %q, want empty", s2.Title)
+	}
+}
+
+func TestListSessions_SortByUpdatedAtDesc(t *testing.T) {
+	// updated_at sort is the dropdown-ordering key for the chat-widget
+	// session picker (most recently active first). seed: sess_b
+	// updated 2024-02-01, sess_a updated 2024-01-01 → DESC = b, a.
+	w := do(t, newTestHandler(t), "/sessions?sort=updated_at")
+	mustStatus(t, w, http.StatusOK)
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(resp.Items))
+	}
+	if resp.Items[0].ID != "sess_b" || resp.Items[1].ID != "sess_a" {
+		t.Errorf("order = [%s, %s], want [sess_b, sess_a]", resp.Items[0].ID, resp.Items[1].ID)
+	}
+}
+
+func TestListSessions_SortByUpdatedAtAsc(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions?sort=updated_at&direction=asc")
+	mustStatus(t, w, http.StatusOK)
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if resp.Items[0].ID != "sess_a" || resp.Items[1].ID != "sess_b" {
+		t.Errorf("order = [%s, %s], want [sess_a, sess_b]", resp.Items[0].ID, resp.Items[1].ID)
+	}
+}
+
 func TestGetSession_NotFound(t *testing.T) {
 	w := do(t, newTestHandler(t), "/sessions/does_not_exist")
 	if w.Code != http.StatusNotFound {
@@ -791,7 +865,7 @@ func TestGetSession_ToolCallsPassthrough(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_tc','tool-call session','gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_tc','tool-call session',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`)
 
 	// user → assistant tool-call-only → tool → assistant text answer.
 	// The first assistant row has empty content (the LLM only emitted
@@ -855,7 +929,7 @@ func TestGetSession_EmptyToolCallsOmitted(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc','gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc',NULL,'gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z')`)
 	exec(`INSERT INTO messages VALUES ('sess_empty_tc',1,'user','hi','2024-03-02T10:00:00Z')`)
 	exec(`INSERT INTO messages VALUES ('sess_empty_tc',2,'assistant','hello','2024-03-02T10:00:01Z')`)
 	exec(`INSERT INTO messages VALUES ('sess_empty_tc',3,'assistant','again','2024-03-02T10:00:02Z')`)
@@ -895,7 +969,7 @@ func TestGetSession_SynthesisesErrorRowFromLLMError(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_err','failed turn','gpt-4o','{}','user_4','group_z','2024-04-01T10:00:00Z','2024-04-01T10:00:05Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_err','failed turn',NULL,'gpt-4o','{}','user_4','group_z','2024-04-01T10:00:00Z','2024-04-01T10:00:05Z')`)
 
 	// Only the user message exists — the LLM call errored before any
 	// assistant row could be written.
@@ -966,7 +1040,7 @@ func TestGetSession_ErrorRowInterleavedByTimestamp(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session','gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session',NULL,'gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z')`)
 
 	// Turn 1: user → assistant (successful).
 	exec(`INSERT INTO messages VALUES ('sess_mix',1,'user','hi','2024-05-01T10:00:00Z')`)
@@ -1018,7 +1092,7 @@ func TestGetSession_PrecisionMismatchOrdersErrorAfterMessage(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_prec','precision session','gpt-4o','{}','user_7','group_z','2024-07-01T10:00:00Z','2024-07-01T10:00:05Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_prec','precision session',NULL,'gpt-4o','{}','user_7','group_z','2024-07-01T10:00:00Z','2024-07-01T10:00:05Z')`)
 
 	// Real-world shape: user message at second precision, llm_error at
 	// microsecond precision within the same wall-clock second. The
@@ -1057,7 +1131,7 @@ func TestGetSession_ErrorContentFallback(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session','gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session',NULL,'gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z')`)
 	exec(`INSERT INTO messages VALUES ('sess_fb',1,'user','q','2024-06-01T10:00:00Z')`)
 	// Payload is valid JSON but has no response_body_excerpt — must fall back.
 	exec(`INSERT INTO session_events VALUES ('evt_fb1','sess_fb',1,'2024-06-01T10:00:02Z','llm_error',NULL,0,'{"v":1,"phase":"chat.parse"}','2024-06-01T10:00:02Z')`)
@@ -1416,7 +1490,7 @@ func TestEventsStats_GroupBy_SampleSessionsRespectsLimit(t *testing.T) {
 	// three distinct sessions. Most-recent timestamp goes to sess_c so
 	// we can also confirm it lands at index 0 under N=2.
 	if _, err := h.db.Exec(
-		`INSERT INTO sessions VALUES ('sess_c','third','gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`); err != nil {
+		`INSERT INTO sessions VALUES ('sess_c','third',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.db.Exec(
@@ -1526,7 +1600,7 @@ func TestEventsStats_GroupBy_SampleSessionIDsTiebreaker(t *testing.T) {
 	const sameTS = "2024-04-01T10:00:00Z"
 	for _, sid := range []string{"sess_beta", "sess_alpha"} {
 		if _, err := h.db.Exec(
-			`INSERT INTO sessions VALUES (?,'tie','gpt-4o','{}','user_tie','group_tie',?,?)`,
+			`INSERT INTO sessions VALUES (?,'tie',NULL,'gpt-4o','{}','user_tie','group_tie',?,?)`,
 			sid, sameTS, sameTS); err != nil {
 			t.Fatal(err)
 		}
@@ -1642,26 +1716,26 @@ func seedBucketEvents(t *testing.T, db *sql.DB) {
 			tokIn, tokOut, costIn, costOut)
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','','gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','',NULL,'gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a1','sess_bk_alice',1,'2026-05-10T10:00:00Z','llm_response',NULL,100,?,'2026-05-10T10:00:00Z')`,
 		llm(100, 50, 0.010, 0.020))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a2','sess_bk_alice',2,'2026-05-12T10:00:00Z','llm_response',NULL,100,?,'2026-05-12T10:00:00Z')`,
 		llm(200, 100, 0.020, 0.040))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','','gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','',NULL,'gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b1','sess_bk_bob',1,'2026-05-14T10:00:00Z','llm_response',NULL,200,?,'2026-05-14T10:00:00Z')`,
 		llm(300, 150, 0.030, 0.060))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b2','sess_bk_bob',2,'2026-05-14T11:00:00Z','tool_call_result','evt_bk_b1',50,'{"v":1,"result":"ok"}','2026-05-14T11:00:00Z')`)
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','','gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','',NULL,'gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_c1','sess_bk_carol',1,'2026-05-16T10:00:00Z','llm_response',NULL,100,?,'2026-05-16T10:00:00Z')`,
 		llm(400, 200, 0.040, 0.080))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_dave','','gpt-4o','{}','u_dave','acme','2026-06-03T09:00:00Z','2026-06-03T10:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_dave','',NULL,'gpt-4o','{}','u_dave','acme','2026-06-03T09:00:00Z','2026-06-03T10:00:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_d1','sess_bk_dave',1,'2026-06-03T10:00:00Z','llm_response',NULL,100,?,'2026-06-03T10:00:00Z')`,
 		llm(500, 250, 0.050, 0.100))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_ed','','gpt-4o','{}','u_ed','acme','2025-07-15T09:00:00Z','2025-07-15T10:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_ed','',NULL,'gpt-4o','{}','u_ed','acme','2025-07-15T09:00:00Z','2025-07-15T10:00:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_e1','sess_bk_ed',1,'2025-07-15T10:00:00Z','llm_response',NULL,100,?,'2025-07-15T10:00:00Z')`,
 		llm(600, 300, 0.060, 0.120))
 }
@@ -2208,12 +2282,12 @@ func seedSpanningSessions(t *testing.T, db *sql.DB) {
 	}
 
 	// Container created APRIL, event in MAY — under se.ts contract, IN window.
-	exec(`INSERT INTO sessions VALUES ('sess_span_inside','','gpt-4o','{}','u_ts_inside','tsax','2026-04-30T23:00:00Z','2026-05-15T11:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_span_inside','',NULL,'gpt-4o','{}','u_ts_inside','tsax','2026-04-30T23:00:00Z','2026-05-15T11:00:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_ts_inside','sess_span_inside',1,'2026-05-15T10:00:00Z','llm_response',NULL,100,?,'2026-05-15T10:00:00Z')`,
 		llm(700, 350, 0.070, 0.140))
 
 	// Container created MAY, event in APRIL — under se.ts contract, OUT of window.
-	exec(`INSERT INTO sessions VALUES ('sess_span_outside','','gpt-4o','{}','u_ts_outside','tsax','2026-05-05T09:00:00Z','2026-05-05T10:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_span_outside','',NULL,'gpt-4o','{}','u_ts_outside','tsax','2026-05-05T09:00:00Z','2026-05-05T10:00:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_ts_outside','sess_span_outside',1,'2026-04-10T10:00:00Z','llm_response',NULL,100,?,'2026-04-10T10:00:00Z')`,
 		llm(800, 400, 0.080, 0.160))
 }
@@ -2766,7 +2840,7 @@ func TestSessionEvents_LimitBoundaryAndBurstSemantics(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_burst','burst','gpt-4o','{}','user_b','group_b','2024-05-19T00:00:00Z','2024-05-19T00:00:30Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_burst','burst',NULL,'gpt-4o','{}','user_b','group_b','2024-05-19T00:00:00Z','2024-05-19T00:00:30Z')`)
 	// Seed 30 events with seq=1..30. Insert in a non-sorted order to
 	// ensure the ORDER BY clause is doing the work, not the insertion order.
 	insertOrder := []int{15, 7, 1, 22, 30, 14, 3, 18, 9, 26, 5, 12, 20, 28, 2, 17, 24, 8, 19, 4, 21, 11, 27, 6, 13, 25, 10, 16, 29, 23}

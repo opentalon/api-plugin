@@ -66,11 +66,17 @@ type SessionStats struct {
 	CostOutputTotal float64 `json:"cost_output_total"`
 }
 
-// SessionListItem is one row of GET /sessions.
+// SessionListItem is one row of GET /sessions. Title is the short LLM-
+// generated session label populated by the orchestrator's background
+// title-generation pass after the first assistant turn; absent (NULL in
+// the sessions row) for pre-generation turns and for sessions written
+// before the column existed, so consumers must treat empty/missing as
+// "no title yet" rather than an error.
 type SessionListItem struct {
 	ID          string       `json:"id"`
 	EntityID    string       `json:"entity_id,omitempty"`
 	GroupID     string       `json:"group_id,omitempty"`
+	Title       string       `json:"title,omitempty"`
 	Summary     string       `json:"summary,omitempty"`
 	ActiveModel string       `json:"active_model,omitempty"`
 	CreatedAt   string       `json:"created_at"`
@@ -107,6 +113,7 @@ type SessionDetail struct {
 	ID          string            `json:"id"`
 	EntityID    string            `json:"entity_id,omitempty"`
 	GroupID     string            `json:"group_id,omitempty"`
+	Title       string            `json:"title,omitempty"` // see SessionListItem.Title
 	Summary     string            `json:"summary,omitempty"`
 	ActiveModel string            `json:"active_model,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
@@ -636,6 +643,7 @@ const maxEntityIDList = 200
 // resolveSessionSort's switch.
 const (
 	sortKeyCreatedAt     = "created_at"
+	sortKeyUpdatedAt     = "updated_at"
 	sortKeyCostTotal     = "cost_total"
 	sortKeyLLMCallCount  = "llm_call_count"
 	sortKeyToolCallCount = "tool_call_count"
@@ -681,12 +689,12 @@ func sessionSortFromQuery(r *http.Request) (sessionSort, error) {
 		d = defaultSessionSort.Direction
 	}
 	switch s {
-	case sortKeyCreatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
+	case sortKeyCreatedAt, sortKeyUpdatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
 		sortKeyToolCallCount, sortKeyTokensIn, sortKeyTokensOut:
 	default:
 		return sessionSort{}, fmt.Errorf(
-			"sort: unsupported key %q (allowed: %s, %s, %s, %s, %s, %s)",
-			s, sortKeyCreatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
+			"sort: unsupported key %q (allowed: %s, %s, %s, %s, %s, %s, %s)",
+			s, sortKeyCreatedAt, sortKeyUpdatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
 			sortKeyToolCallCount, sortKeyTokensIn, sortKeyTokensOut)
 	}
 	switch d {
@@ -707,6 +715,10 @@ func resolveSessionSort(s sessionSort, d Dialect) sessionSortDef {
 	case sortKeyCreatedAt:
 		def.Expr = "s.created_at"
 		def.Extract = func(r SessionListItem) string { return r.CreatedAt }
+		def.BindValue = func(raw string) (any, error) { return raw, nil }
+	case sortKeyUpdatedAt:
+		def.Expr = "s.updated_at"
+		def.Extract = func(r SessionListItem) string { return r.UpdatedAt }
 		def.BindValue = func(raw string) (any, error) { return raw, nil }
 	case sortKeyCostTotal:
 		def.Expr = llmAggExpr(d, payloadFieldCostInput, false) + " + " + llmAggExpr(d, payloadFieldCostOutput, false)
@@ -1176,7 +1188,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 
 	var q strings.Builder
 	q.WriteString(`SELECT s.id, COALESCE(s.entity_id,''), COALESCE(s.group_id,''),
-		COALESCE(s.summary,''), COALESCE(s.active_model,''),
+		COALESCE(s.title,''), COALESCE(s.summary,''), COALESCE(s.active_model,''),
 		s.created_at, s.updated_at, `)
 	q.WriteString(sessionStatsSelect(d))
 	q.WriteString(` FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
@@ -1208,7 +1220,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 		}
 	}
 
-	q.WriteString(` GROUP BY s.id, s.entity_id, s.group_id, s.summary, s.active_model, s.created_at, s.updated_at`)
+	q.WriteString(` GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model, s.created_at, s.updated_at`)
 	if havingCursor {
 		q.WriteString(" HAVING ")
 		q.WriteString(keysetCmp(def.Expr, sort.Direction))
@@ -1238,7 +1250,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 	items := make([]SessionListItem, 0, limit)
 	for rows.Next() {
 		var s SessionListItem
-		if err := rows.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Summary, &s.ActiveModel,
+		if err := rows.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Title, &s.Summary, &s.ActiveModel,
 			&s.CreatedAt, &s.UpdatedAt,
 			&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 			&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
@@ -1293,15 +1305,15 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 	var metadataJSON string
 	var q strings.Builder
 	q.WriteString(`SELECT s.id, COALESCE(s.entity_id,''), COALESCE(s.group_id,''),
-		COALESCE(s.summary,''), COALESCE(s.active_model,''),
+		COALESCE(s.title,''), COALESCE(s.summary,''), COALESCE(s.active_model,''),
 		COALESCE(s.metadata,'{}'), s.created_at, s.updated_at, `)
 	q.WriteString(sessionStatsSelect(d))
 	q.WriteString(` FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id
 		WHERE s.id = ?
-		GROUP BY s.id, s.entity_id, s.group_id, s.summary, s.active_model, s.metadata, s.created_at, s.updated_at`)
+		GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model, s.metadata, s.created_at, s.updated_at`)
 
 	row := db.QueryRow(d.Rebind(q.String()), id)
-	err := row.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Summary, &s.ActiveModel,
+	err := row.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Title, &s.Summary, &s.ActiveModel,
 		&metadataJSON, &s.CreatedAt, &s.UpdatedAt,
 		&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 		&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
