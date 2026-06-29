@@ -43,6 +43,17 @@ func (h *Handler) routes() *http.ServeMux {
 	mux.HandleFunc("GET /sessions", h.handleListSessions)
 	mux.HandleFunc("GET /sessions/{id}", h.handleGetSession)
 	mux.HandleFunc("GET /sessions/{id}/events", h.handleSessionEvents)
+	// GET /sessions/{id}/debug-events is the 6th data endpoint, a
+	// deliberate exception to the "five endpoints" cap above: the
+	// structured session_events log records *that* an LLM call happened
+	// and its costs, but never the raw HTTP request/response bytes sent
+	// to and returned by the provider. Diagnosing a bad answer (wrong
+	// tool schema sent, provider error body, truncated streaming
+	// response) requires the verbatim bodies from ai_debug_events, which
+	// no other endpoint exposes — raw-body inspection is the one job the
+	// review UI cannot do with the existing surface, so it earns its own
+	// route rather than overloading /sessions/{id}/events.
+	mux.HandleFunc("GET /sessions/{id}/debug-events", h.handleSessionDebugEvents)
 	mux.HandleFunc("GET /events", h.handleListEvents)
 	mux.HandleFunc("GET /events/stats", h.handleEventsStats)
 	mux.HandleFunc("GET /prompt-snapshots", h.handlePromptSnapshot)
@@ -183,6 +194,34 @@ type SessionEventsResponse struct {
 	Items []Event `json:"items"`
 }
 
+// DebugEvent is one raw LLM request/response/error row from
+// ai_debug_events — the verbatim HTTP traffic between OpenTalon and the
+// provider, surfaced by GET /sessions/{id}/debug-events.
+//
+// Body is a plain string, NOT json.RawMessage: request and response rows
+// hold valid provider JSON, but direction='error' rows store a
+// "Class: message" diagnostic that is not valid JSON. Typing Body as
+// json.RawMessage would make the encoder emit those error rows as
+// malformed JSON. The Rails side parses Body itself only when it needs
+// the provider_response_id correlation (response rows), so a string is
+// both safe and sufficient.
+type DebugEvent struct {
+	ID        string `json:"id"`
+	TraceID   string `json:"trace_id"`
+	TS        string `json:"ts"`
+	Direction string `json:"direction"`
+	Status    int    `json:"status"`
+	URL       string `json:"url"`
+	Body      string `json:"body"`
+}
+
+// DebugEventsResponse is the GET /sessions/{id}/debug-events envelope,
+// mirroring SessionEventsResponse: a bare {items} list, no cursor —
+// debug rows are read as a whole bounded session replay, not tail-polled.
+type DebugEventsResponse struct {
+	Items []DebugEvent `json:"items"`
+}
+
 // EventStats is GET /events/stats — cross-session aggregates that mirror
 // SessionTotals plus the session count, scoped by the same filters.
 //
@@ -264,6 +303,15 @@ type PromptSnapshot struct {
 const (
 	defaultLimit = 25
 	maxLimit     = 200
+)
+
+// debugDefaultLimit / debugMaxLimit cap GET /sessions/{id}/debug-events.
+// Larger than the analytics defaults (see debugLimitFromQuery): raw-body
+// replay pulls a whole short session at once, but the 500 cap still stops
+// a runaway pull of multi-MB bodies.
+const (
+	debugDefaultLimit = 200
+	debugMaxLimit     = 500
 )
 
 // maxSampleSessions caps ?sample_sessions=N on /events/stats. 5 covers
@@ -405,6 +453,26 @@ func limitFromQuery(r *http.Request) (int, error) {
 	}
 	if v > maxLimit {
 		return 0, fmt.Errorf("limit: at most %d, got %d", maxLimit, v)
+	}
+	return v, nil
+}
+
+// debugLimitFromQuery reads `?limit=` for the debug-events endpoint.
+// It deliberately does NOT reuse limitFromQuery: raw-body replay wants a
+// larger default (200, a whole short session in one shot) and a higher
+// cap (500) than the analytics list endpoints' 25/200, since the consumer
+// is a one-off "show me the full exchange" inspection, not a paged feed.
+func debugLimitFromQuery(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return debugDefaultLimit, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("limit: must be a positive integer, got %q", raw)
+	}
+	if v > debugMaxLimit {
+		return 0, fmt.Errorf("limit: at most %d, got %d", debugMaxLimit, v)
 	}
 	return v, nil
 }
@@ -939,6 +1007,40 @@ func (h *Handler) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, SessionEventsResponse{Items: items})
+}
+
+// handleSessionDebugEvents serves GET /sessions/{id}/debug-events: the
+// verbatim LLM request/response/error bodies for one session, ordered
+// chronologically. Mirrors handleSessionEvents — same path-id read,
+// same sessionExists 404 probe (an existing session with no captured
+// debug rows returns {"items":[]}, 200) — but uses the debug-specific
+// limit (default 200, max 500) since the consumer wants the whole short
+// exchange at once, not a paged tail-poll.
+func (h *Handler) handleSessionDebugEvents(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("id")
+
+	limit, err := debugLimitFromQuery(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	exists, err := sessionExists(h.db, h.dialect, sessionID)
+	if err != nil {
+		writeServerErr(w, r, "/sessions/{id}/debug-events", err)
+		return
+	}
+	if !exists {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	items, err := listSessionDebugEventsAsc(h.db, h.dialect, sessionID, limit)
+	if err != nil {
+		writeServerErr(w, r, "/sessions/{id}/debug-events", err)
+		return
+	}
+	writeJSON(w, DebugEventsResponse{Items: items})
 }
 
 func (h *Handler) handleListEvents(w http.ResponseWriter, r *http.Request) {
@@ -1587,6 +1689,44 @@ func listSessionEventsAsc(db *sql.DB, d Dialect, sessionID string, sinceSeq int,
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("listSessionEventsAsc rows: %w", err)
+	}
+	return items, nil
+}
+
+// listSessionDebugEventsAsc reads the raw LLM exchange for one session in
+// chronological order. The ORDER BY (ts, id) and WHERE session_id are
+// served directly by idx_ai_debug_events_session_ts (the id tiebreaker
+// keeps request/response pairs written in the same millisecond stably
+// ordered, which the Rails correlation relies on — the request row is the
+// 'request' immediately preceding its paired 'response' by ts). COALESCE
+// guards the nullable trace_id/status/url; body is NOT NULL so it scans
+// straight into a string (error-direction rows hold non-JSON text, hence
+// DebugEvent.Body is a string, not json.RawMessage).
+func listSessionDebugEventsAsc(db *sql.DB, d Dialect, sessionID string, limit int) ([]DebugEvent, error) {
+	rows, err := db.Query(d.Rebind(
+		`SELECT id, session_id, COALESCE(trace_id,''), ts, direction,
+			COALESCE(status,0), COALESCE(url,''), body
+		 FROM ai_debug_events
+		 WHERE session_id = ?
+		 ORDER BY ts ASC, id ASC
+		 LIMIT ?`), sessionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("listSessionDebugEventsAsc: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	items := make([]DebugEvent, 0, limit)
+	for rows.Next() {
+		var e DebugEvent
+		var sessionIDOut string
+		if err := rows.Scan(&e.ID, &sessionIDOut, &e.TraceID, &e.TS, &e.Direction,
+			&e.Status, &e.URL, &e.Body); err != nil {
+			return nil, fmt.Errorf("listSessionDebugEventsAsc scan: %w", err)
+		}
+		items = append(items, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listSessionDebugEventsAsc rows: %w", err)
 	}
 	return items, nil
 }
