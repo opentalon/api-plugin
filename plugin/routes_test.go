@@ -61,6 +61,19 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			content TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE ai_debug_events (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			trace_id TEXT,
+			ts TEXT NOT NULL,
+			direction TEXT NOT NULL,
+			status INTEGER,
+			url TEXT,
+			body TEXT NOT NULL
+		)`,
+		// Mirrors the opentalon migration index that backs the
+		// session_id WHERE + (ts, id) ORDER BY on /sessions/{id}/debug-events.
+		`CREATE INDEX idx_ai_debug_events_session_ts ON ai_debug_events(session_id, ts)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatalf("DDL: %v", err)
@@ -100,6 +113,15 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 	exec(`INSERT INTO session_events VALUES ('evt_b2','sess_b',2,'2024-02-01T10:00:10Z','tool_call_result','evt_b1',50,'{"v":1,"result":"ok"}','2024-02-01T10:00:10Z')`)
 
 	exec(`INSERT INTO prompt_snapshots VALUES ('sha_sys_1','system_prompt','You are a helpful assistant.','2024-01-01T00:00:00Z')`)
+
+	// Raw debug rows on sess_a: a request (single JSON), a STREAMED response
+	// stored verbatim as the SSE wire stream, and an error row whose body is a
+	// non-JSON "Class: message" diagnostic. Distinct ts so order is testable.
+	// sess_b has none (exercises the "session exists, no debug rows" path).
+	exec(`INSERT INTO ai_debug_events VALUES ('dbg_a1','sess_a','tr_1','2024-01-01T10:00:00Z','request',NULL,'https://provider/v1/chat/completions','{"model":"gpt-oss-120b"}')`)
+	exec(`INSERT INTO ai_debug_events VALUES ('dbg_a2','sess_a','tr_1','2024-01-01T10:00:01Z','response',200,'https://provider/v1/chat/completions',?)`,
+		"data: {\"id\":\"chatcmpl-x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: [DONE]\n")
+	exec(`INSERT INTO ai_debug_events VALUES ('dbg_a3','sess_a','tr_2','2024-01-01T10:00:02Z','error',NULL,NULL,'Net::ReadTimeout: execution expired')`)
 
 	t.Cleanup(func() { _ = db.Close() })
 	return db, sqliteDialect
@@ -2918,4 +2940,60 @@ func seqsOf(items []Event) []int {
 		out[i] = e.Seq
 	}
 	return out
+}
+
+func TestSessionDebugEvents_ReturnsVerbatimRowsInTimeOrder(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/sess_a/debug-events")
+	mustStatus(t, w, http.StatusOK)
+
+	var resp DebugEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+
+	if len(resp.Items) != 3 {
+		t.Fatalf("items = %d, want 3", len(resp.Items))
+	}
+	for i, want := range []string{"request", "response", "error"} {
+		if resp.Items[i].Direction != want {
+			t.Fatalf("items[%d].direction = %q, want %q (ts order)", i, resp.Items[i].Direction, want)
+		}
+	}
+	// The streamed response is preserved verbatim as the SSE wire stream — NOT
+	// reassembled into a single JSON object.
+	if !strings.HasPrefix(resp.Items[1].Body, "data: {") {
+		t.Fatalf("response body = %q, want raw SSE starting with 'data: {'", resp.Items[1].Body)
+	}
+	// The error row's body is a non-JSON diagnostic string, surfaced as-is.
+	if resp.Items[2].Body != "Net::ReadTimeout: execution expired" {
+		t.Fatalf("error body = %q, want the verbatim diagnostic", resp.Items[2].Body)
+	}
+}
+
+func TestSessionDebugEvents_404OnUnknownSession(t *testing.T) {
+	w := do(t, newTestHandler(t), "/sessions/does-not-exist/debug-events")
+	mustStatus(t, w, http.StatusNotFound)
+}
+
+func TestSessionDebugEvents_EmptyItemsWhenSessionHasNoDebugRows(t *testing.T) {
+	// sess_b exists but has no ai_debug_events rows → 200 with an empty list,
+	// distinct from the 404 of a non-existent session.
+	w := do(t, newTestHandler(t), "/sessions/sess_b/debug-events")
+	mustStatus(t, w, http.StatusOK)
+
+	var resp DebugEventsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 0 {
+		t.Fatalf("items = %d, want 0", len(resp.Items))
+	}
+}
+
+func TestSessionDebugEvents_LimitValidation(t *testing.T) {
+	h := newTestHandler(t)
+	for _, target := range []string{
+		"/sessions/sess_a/debug-events?limit=0",
+		"/sessions/sess_a/debug-events?limit=-1",
+		"/sessions/sess_a/debug-events?limit=501",
+		"/sessions/sess_a/debug-events?limit=abc",
+	} {
+		mustStatus(t, do(t, h, target), http.StatusBadRequest)
+	}
 }
