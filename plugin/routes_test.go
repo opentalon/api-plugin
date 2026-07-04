@@ -36,7 +36,7 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			created_at TEXT,
 			updated_at TEXT
 		)`,
-		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, created_at TEXT)`,
+		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, metadata TEXT, created_at TEXT)`,
 		`CREATE UNIQUE INDEX idx_messages_session_seq ON messages(session_id, seq)`,
 		`CREATE TABLE session_events (
 			id TEXT PRIMARY KEY,
@@ -94,8 +94,8 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 	exec(`INSERT INTO sessions VALUES ('sess_a','first session','First chat title','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z')`)
 	exec(`INSERT INTO sessions VALUES ('sess_b','second session',NULL,'gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z')`)
 
-	exec(`INSERT INTO messages VALUES ('sess_a',1,'user','hi','2024-01-01T10:00:00Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_a',2,'assistant','hello','2024-01-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_a',1,'user','hi','2024-01-01T10:00:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_a',2,'assistant','hello','2024-01-01T10:00:01Z')`)
 
 	// llm_response payloads — tokens + cost matching what the opentalon
 	// provider wrapper stamps via the cost-tracking PR. Two events on
@@ -893,10 +893,10 @@ func TestGetSession_ToolCallsPassthrough(t *testing.T) {
 	// The first assistant row has empty content (the LLM only emitted
 	// tool_calls); the second carries the final text. Both should pair
 	// with the two llm_response events in order.
-	exec(`INSERT INTO messages VALUES ('sess_tc',1,'user','show me items','2024-03-01T10:00:00Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_tc',2,'assistant','','2024-03-01T10:00:01Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_tc',3,'tool','{"items":[]}','2024-03-01T10:00:02Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_tc',4,'assistant','No items found.','2024-03-01T10:00:03Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',1,'user','show me items','2024-03-01T10:00:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',2,'assistant','','2024-03-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',3,'tool','{"items":[]}','2024-03-01T10:00:02Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',4,'assistant','No items found.','2024-03-01T10:00:03Z')`)
 
 	toolCallsPayload := `{"v":1,"raw_content_excerpt":"","tokens_in":50,"tokens_out":20,"cost_input":0,"cost_output":0,"native_tool_calls_raw":[{"id":"call_1","type":"function","function":{"name":"list-items","arguments":"{}"}}],"finish_reason":"tool_calls"}`
 	textOnlyPayload := `{"v":1,"raw_content_excerpt":"No items","tokens_in":80,"tokens_out":15,"cost_input":0,"cost_output":0,"finish_reason":"stop"}`
@@ -938,6 +938,92 @@ func TestGetSession_ToolCallsPassthrough(t *testing.T) {
 	}
 }
 
+// TestGetSession_MessageMetadataPassthrough pins the per-message metadata
+// column (opentalon-core migration 013): a tool-confirmation prompt row and its
+// reply row carry a raw JSON metadata map through to the API response, while a
+// plain turn (NULL metadata) omits the key entirely — the byte-identical
+// contract that lets the chat widget rebuild the Approve/Reject UI after reload.
+func TestGetSession_MessageMetadataPassthrough(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_md','md session',NULL,'gpt-4o','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z')`)
+	// Plain user turn (NULL metadata) → key omitted.
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_md',1,'user','delete 3 items','2024-08-01T10:00:00Z')`)
+	// Assistant confirmation prompt carries the tool-confirmation marker.
+	exec(`INSERT INTO messages (session_id, seq, role, content, metadata, created_at) VALUES ('sess_md',2,'assistant','Proceed?','{"prompt_type":"tool_confirmation","tool_call_id":"call_9","options":"approve,reject"}','2024-08-01T10:00:01Z')`)
+	// User reply carries the confirmation_response marker.
+	exec(`INSERT INTO messages (session_id, seq, role, content, metadata, created_at) VALUES ('sess_md',3,'user','Approve','{"prompt_type":"confirmation_response","action":"approve"}','2024-08-01T10:00:02Z')`)
+
+	w := do(t, h, "/sessions/sess_md")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	if len(s.Messages) != 3 {
+		t.Fatalf("got %d messages, want 3", len(s.Messages))
+	}
+	if len(s.Messages[0].Metadata) != 0 {
+		t.Errorf("plain user row metadata = %s, want absent", s.Messages[0].Metadata)
+	}
+	var prompt map[string]string
+	if err := json.Unmarshal(s.Messages[1].Metadata, &prompt); err != nil {
+		t.Fatalf("prompt row metadata not valid JSON: %v (raw %s)", err, s.Messages[1].Metadata)
+	}
+	if prompt["prompt_type"] != "tool_confirmation" || prompt["tool_call_id"] != "call_9" {
+		t.Errorf("prompt row metadata mismatch: %+v", prompt)
+	}
+	var reply map[string]string
+	if err := json.Unmarshal(s.Messages[2].Metadata, &reply); err != nil {
+		t.Fatalf("reply row metadata not valid JSON: %v", err)
+	}
+	if reply["prompt_type"] != "confirmation_response" || reply["action"] != "approve" {
+		t.Errorf("reply row metadata mismatch: %+v", reply)
+	}
+
+	// omitempty contract: the JSON key appears exactly on the two rows that
+	// carry metadata. Session-level metadata is '{}' → omitted, so it does not
+	// inflate the count.
+	if n := strings.Count(w.Body.String(), `"metadata":`); n != 2 {
+		t.Errorf("metadata JSON key appears %d times, want 2; body = %s", n, w.Body.String())
+	}
+}
+
+// TestGetSession_MalformedMessageMetadataDropped guards the read path: a row
+// whose metadata column holds non-JSON bytes must be dropped (key omitted), not
+// inlined — otherwise one bad row would produce an invalid response body for
+// the whole session.
+func TestGetSession_MalformedMessageMetadataDropped(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	exec(`INSERT INTO sessions VALUES ('sess_bad','bad md',NULL,'gpt-4o','{}','user_6','group_z','2024-08-02T10:00:00Z','2024-08-02T10:30:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, metadata, created_at) VALUES ('sess_bad',1,'assistant','x','not json','2024-08-02T10:00:00Z')`)
+
+	w := do(t, h, "/sessions/sess_bad")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+	if len(s.Messages) != 1 {
+		t.Fatalf("got %d messages, want 1", len(s.Messages))
+	}
+	if len(s.Messages[0].Metadata) != 0 {
+		t.Errorf("malformed metadata should be dropped, got %s", s.Messages[0].Metadata)
+	}
+	if strings.Contains(w.Body.String(), `"metadata":`) {
+		t.Errorf("malformed metadata leaked into body: %s", w.Body.String())
+	}
+}
+
 // TestGetSession_EmptyToolCallsOmitted covers the two "no tool calls
 // were actually made" payload shapes — explicit null and explicit empty
 // array. Both must be treated as absent so the bubble UI doesn't render
@@ -952,9 +1038,9 @@ func TestGetSession_EmptyToolCallsOmitted(t *testing.T) {
 	}
 
 	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc',NULL,'gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_empty_tc',1,'user','hi','2024-03-02T10:00:00Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_empty_tc',2,'assistant','hello','2024-03-02T10:00:01Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_empty_tc',3,'assistant','again','2024-03-02T10:00:02Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',1,'user','hi','2024-03-02T10:00:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',2,'assistant','hello','2024-03-02T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',3,'assistant','again','2024-03-02T10:00:02Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_empty1','sess_empty_tc',1,'2024-03-02T10:00:00Z','llm_response',NULL,100,'{"v":1,"native_tool_calls_raw":null}','2024-03-02T10:00:00Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_empty2','sess_empty_tc',2,'2024-03-02T10:00:02Z','llm_response',NULL,100,'{"v":1,"native_tool_calls_raw":[]}','2024-03-02T10:00:02Z')`)
 
@@ -995,7 +1081,7 @@ func TestGetSession_SynthesisesErrorRowFromLLMError(t *testing.T) {
 
 	// Only the user message exists — the LLM call errored before any
 	// assistant row could be written.
-	exec(`INSERT INTO messages VALUES ('sess_err',1,'user','Wieviele Items habe ich?','2024-04-01T10:00:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_err',1,'user','Wieviele Items habe ich?','2024-04-01T10:00:00Z')`)
 
 	// Full turn-startup events (knowledge_retrieval, turn_start,
 	// llm_request) are omitted from this seed — they're irrelevant to
@@ -1065,12 +1151,12 @@ func TestGetSession_ErrorRowInterleavedByTimestamp(t *testing.T) {
 	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session',NULL,'gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z')`)
 
 	// Turn 1: user → assistant (successful).
-	exec(`INSERT INTO messages VALUES ('sess_mix',1,'user','hi','2024-05-01T10:00:00Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_mix',2,'assistant','hello','2024-05-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_mix',1,'user','hi','2024-05-01T10:00:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_mix',2,'assistant','hello','2024-05-01T10:00:01Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_mx1','sess_mix',1,'2024-05-01T10:00:01Z','llm_response',NULL,100,'{"v":1}','2024-05-01T10:00:01Z')`)
 
 	// Turn 2: user → llm_error (failed, no assistant row).
-	exec(`INSERT INTO messages VALUES ('sess_mix',3,'user','tell me more','2024-05-01T10:00:10Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_mix',3,'user','tell me more','2024-05-01T10:00:10Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_mx2','sess_mix',2,'2024-05-01T10:00:12Z','llm_error',NULL,0,'{"v":1,"phase":"chat.transport","response_body_excerpt":"connection refused"}','2024-05-01T10:00:12Z')`)
 
 	w := do(t, h, "/sessions/sess_mix")
@@ -1120,7 +1206,7 @@ func TestGetSession_PrecisionMismatchOrdersErrorAfterMessage(t *testing.T) {
 	// microsecond precision within the same wall-clock second. The
 	// event actually happened ~50 ms AFTER the message was written —
 	// the synthetic error row must land AFTER the user.
-	exec(`INSERT INTO messages VALUES ('sess_prec',1,'user','q','2024-07-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_prec',1,'user','q','2024-07-01T10:00:01Z')`)
 	exec(`INSERT INTO session_events VALUES ('evt_pr1','sess_prec',1,'2024-07-01T10:00:01.050745Z','llm_error',NULL,0,'{"v":1,"phase":"chat.transport","response_body_excerpt":"dial tcp: connect refused"}','2024-07-01T10:00:01.050745Z')`)
 
 	w := do(t, h, "/sessions/sess_prec")
@@ -1154,7 +1240,7 @@ func TestGetSession_ErrorContentFallback(t *testing.T) {
 		}
 	}
 	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session',NULL,'gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z')`)
-	exec(`INSERT INTO messages VALUES ('sess_fb',1,'user','q','2024-06-01T10:00:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_fb',1,'user','q','2024-06-01T10:00:00Z')`)
 	// Payload is valid JSON but has no response_body_excerpt — must fall back.
 	exec(`INSERT INTO session_events VALUES ('evt_fb1','sess_fb',1,'2024-06-01T10:00:02Z','llm_error',NULL,0,'{"v":1,"phase":"chat.parse"}','2024-06-01T10:00:02Z')`)
 
