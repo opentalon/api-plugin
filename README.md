@@ -143,6 +143,25 @@ Pairing is by ordinal: the n-th assistant message receives the n-th `llm_respons
 }
 ```
 
+#### Per-message `metadata` on `/sessions/{id}`
+
+Each row in `messages[]` carries an optional `metadata` field — the raw JSON map stored in the `messages.metadata` column (opentalon-core migration 013), inlined verbatim. It holds UI markers a chat client uses to rebuild the transcript's interactive state after a reload, e.g. a tool-confirmation prompt (`prompt_type: "tool_confirmation"` plus the `tool_call_id` or `pipeline_id` it belongs to) and the user's resolving reply (`prompt_type: "confirmation_response"`, `action: "approve"|"reject"`). The field is omitted when the column is NULL (every ordinary chat turn), so those rows stay byte-identical to the pre-013 shape; a row whose column holds non-JSON is dropped rather than emitted.
+
+```jsonc
+// GET /sessions/{id} — assistant turn asking for tool-call confirmation
+{
+  "seq": 2,
+  "role": "assistant",
+  "content": "Proceed with deleting 3 items?",
+  "metadata": {
+    "prompt_type": "tool_confirmation",
+    "tool_call_id": "call_9",
+    "options": "approve,reject"
+  },
+  "created_at": "..."
+}
+```
+
 #### Optional grouping on `/events/stats`
 
 To answer "what's going wrong in conversations" in one round-trip instead of N parallel calls, `/events/stats` accepts two optional params:

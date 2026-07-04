@@ -148,11 +148,19 @@ type SessionDetail struct {
 // session_events.payload, and the serializer pairs the n-th assistant
 // message with the n-th llm_response event in chronological order — the
 // orchestrator's 1:1 contract. See annotateAssistantToolCalls.
+//
+// Metadata is the per-message metadata column (opentalon-core migration 013):
+// a small JSON map of UI markers (e.g. a tool-confirmation prompt's
+// prompt_type + tool_call_id/pipeline_id, or a reply's confirmation_response +
+// action) that a chat client uses to rebuild the confirmation UI after a
+// reload. It is inlined raw and omitted when the column is NULL, so rows
+// without metadata stay byte-identical to the pre-013 contract.
 type Message struct {
 	Seq       int             `json:"seq"`
 	Role      string          `json:"role"`
 	Content   string          `json:"content"`
 	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
 	CreatedAt string          `json:"created_at"`
 }
 
@@ -1629,8 +1637,10 @@ func errorContentFromPayload(payload json.RawMessage) string {
 }
 
 func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {
+	// COALESCE(metadata,'') so NULL scans into a Go string (not *string); the
+	// metadata column is nullable and absent on every pre-013 row.
 	rows, err := db.Query(d.Rebind(
-		`SELECT seq, role, content, created_at FROM messages WHERE session_id = ? ORDER BY seq`), id)
+		`SELECT seq, role, content, COALESCE(metadata,''), created_at FROM messages WHERE session_id = ? ORDER BY seq`), id)
 	if err != nil {
 		return nil, fmt.Errorf("sessionMessages: %w", err)
 	}
@@ -1639,8 +1649,16 @@ func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {
 	msgs := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+		var metadata string
+		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &metadata, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("sessionMessages scan: %w", err)
+		}
+		// Inline the raw JSON only when present and non-empty — mirror the
+		// null/[] guard annotateAssistantToolCalls applies to tool_calls, and
+		// keep omitempty rows byte-identical to the pre-013 contract. A
+		// malformed value is dropped rather than poisoning the whole envelope.
+		if md := strings.TrimSpace(metadata); md != "" && md != "null" && md != "{}" && json.Valid([]byte(md)) {
+			m.Metadata = json.RawMessage(md)
 		}
 		msgs = append(msgs, m)
 	}
