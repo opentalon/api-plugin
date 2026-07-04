@@ -1448,10 +1448,22 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 
 // annotateAssistantToolCalls copies payload.native_tool_calls_raw from
 // each llm_response event onto the corresponding assistant message in
-// chronological order. The orchestrator emits exactly one llm_response
-// event per assistant message row, in matching order — that's the
-// pairing contract, by ordinal rather than by seq (the messages table
-// and session_events table maintain independent seq sequences).
+// chronological order. The orchestrator emits exactly one MAIN-LOOP
+// llm_response event per assistant message row, in matching order —
+// that's the pairing contract, by ordinal rather than by seq (the
+// messages table and session_events table maintain independent seq
+// sequences).
+//
+// Side-calls (confirmation classifier, session-title generation, the
+// tool-call repair corrector) also emit llm_response events into the
+// same stream but produce NO assistant message row; counting them would
+// shift the pairing for every later assistant message in the session.
+// They are recognizable by parentage: the orchestrator nests each
+// side-call's llm_request/llm_response under an `*_invoked` sentinel
+// event (confirmation_classification_invoked, session_title_invoked,
+// tool_call_repair_invoked, …), while main-loop responses are never
+// parented on one — so llm_response events whose parent is a sentinel
+// are skipped here.
 //
 // Empty arrays and explicit nulls are omitted: the field exists on
 // Message only when the assistant actually invoked tools, so user/tool
@@ -1460,12 +1472,22 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 // no key, the message simply gets no tool_calls field — the failure
 // mode is "missing optional metadata", not "endpoint 500s".
 func annotateAssistantToolCalls(msgs []Message, evts []Event) {
+	// Ids of *_invoked sentinel events; an llm_response parented on one
+	// belongs to a side-call, not to an assistant message row.
+	sentinels := make(map[string]bool)
+	for _, e := range evts {
+		if strings.HasSuffix(e.EventType, "_invoked") {
+			sentinels[e.ID] = true
+		}
+	}
 	ei := 0
 	for mi := range msgs {
 		if msgs[mi].Role != "assistant" {
 			continue
 		}
-		for ei < len(evts) && evts[ei].EventType != eventTypeLLMResponse {
+		for ei < len(evts) &&
+			(evts[ei].EventType != eventTypeLLMResponse ||
+				(evts[ei].ParentID != "" && sentinels[evts[ei].ParentID])) {
 			ei++
 		}
 		if ei >= len(evts) {
