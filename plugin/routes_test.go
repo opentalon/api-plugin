@@ -3037,6 +3037,50 @@ func TestAnnotateAssistantToolCalls_SkipsSideCallLLMResponses(t *testing.T) {
 	}
 }
 
+// Session summarization is the one side-call whose sentinel event is NOT
+// named `*_invoked`: the orchestrator parents the summarizer's
+// llm_request/llm_response under a `summarization_triggered` event and
+// writes no assistant message row. Its llm_response must be skipped too,
+// or every assistant message after a summarization pairs with the wrong
+// llm_response.
+func TestAnnotateAssistantToolCalls_SkipsSummarizationLLMResponses(t *testing.T) {
+	msgs := []Message{
+		{Seq: 1, Role: "user", Content: "set the responsible user"},
+		{Seq: 2, Role: "assistant", Content: "calling the tool"},
+		{Seq: 3, Role: "tool", Content: "ok"},
+		{Seq: 4, Role: "assistant", Content: "done"},
+	}
+	evts := []Event{
+		// Main-loop response #1: carries the tool call for assistant msg 2.
+		{ID: "e1", EventType: "llm_response",
+			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-1"}]}`)},
+		// Session summarization side-call: `summarization_triggered`
+		// sentinel + nested llm_request/llm_response. No assistant
+		// message row exists for it. The noise payload makes a
+		// mispairing observable (same trick as classifier-noise in
+		// the ordinal-stability test below) — with null payloads on
+		// both candidates the assertion could not tell e4 from e5.
+		{ID: "e2", EventType: "summarization_triggered"},
+		{ID: "e3", ParentID: "e2", EventType: "llm_request"},
+		{ID: "e4", ParentID: "e2", EventType: "llm_response",
+			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"summarizer-noise"}]}`)},
+		// Main-loop response #2: the annotation assistant msg 4 must
+		// receive.
+		{ID: "e5", EventType: "llm_response",
+			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-2"}]}`)},
+	}
+	annotateAssistantToolCalls(msgs, evts)
+
+	if string(msgs[1].ToolCalls) != `[{"id":"tc-1"}]` {
+		t.Fatalf("assistant msg 2 tool_calls = %q, want the main-loop annotation", msgs[1].ToolCalls)
+	}
+	// Without the summarization sentinel, msg 4 pairs with the
+	// summarizer's e4 and carries summarizer-noise instead.
+	if string(msgs[3].ToolCalls) != `[{"id":"tc-2"}]` {
+		t.Fatalf("assistant msg 4 tool_calls = %q, want tc-2 (not the summarizer's)", msgs[3].ToolCalls)
+	}
+}
+
 // Regression guard for the ordinal shift itself: with a side-call response
 // interleaved, the SECOND assistant message must still receive the SECOND
 // main-loop response's annotation.

@@ -1455,14 +1455,17 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 // sequences).
 //
 // Side-calls (confirmation classifier, session-title generation, the
-// tool-call repair corrector) also emit llm_response events into the
-// same stream but produce NO assistant message row; counting them would
-// shift the pairing for every later assistant message in the session.
-// They are recognizable by parentage: the orchestrator nests each
-// side-call's llm_request/llm_response under an `*_invoked` sentinel
-// event (confirmation_classification_invoked, session_title_invoked,
-// tool_call_repair_invoked, …), while main-loop responses are never
-// parented on one — so llm_response events whose parent is a sentinel
+// tool-call repair corrector, session summarization) also emit
+// llm_response events into the same stream but produce NO assistant
+// message row; counting them would shift the pairing for every later
+// assistant message in the session. They are recognizable by
+// parentage: the orchestrator nests each side-call's
+// llm_request/llm_response under a sentinel event — usually named
+// `*_invoked` (confirmation_classification_invoked,
+// session_title_invoked, tool_call_repair_invoked, …), with one
+// naming exception: session summarization parents its side-call under
+// `summarization_triggered`. Main-loop responses are never parented
+// on a sentinel — so llm_response events whose parent is a sentinel
 // are skipped here.
 //
 // Empty arrays and explicit nulls are omitted: the field exists on
@@ -1472,11 +1475,13 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 // no key, the message simply gets no tool_calls field — the failure
 // mode is "missing optional metadata", not "endpoint 500s".
 func annotateAssistantToolCalls(msgs []Message, evts []Event) {
-	// Ids of *_invoked sentinel events; an llm_response parented on one
-	// belongs to a side-call, not to an assistant message row.
+	// Ids of side-call sentinel events (`*_invoked`, plus the
+	// `summarization_triggered` naming exception); an llm_response
+	// parented on one belongs to a side-call, not to an assistant
+	// message row.
 	sentinels := make(map[string]bool)
 	for _, e := range evts {
-		if strings.HasSuffix(e.EventType, "_invoked") {
+		if strings.HasSuffix(e.EventType, "_invoked") || e.EventType == "summarization_triggered" {
 			sentinels[e.ID] = true
 		}
 	}
