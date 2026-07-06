@@ -975,7 +975,11 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	sess, err := getSession(h.db, h.dialect, id)
+	// Staff analytics pass include_hidden=true to see system-injected turns for
+	// debugging; the customer chat widget omits it, so hidden turns stay out of
+	// the user-facing transcript.
+	includeHidden := r.URL.Query().Get("include_hidden") == "true"
+	sess, err := getSession(h.db, h.dialect, id, includeHidden)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeErr(w, http.StatusNotFound, "session not found")
@@ -1520,7 +1524,7 @@ func sessionTotals(db *sql.DB, d Dialect, f sessionFilters) (SessionTotals, erro
 	return t, nil
 }
 
-func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
+func getSession(db *sql.DB, d Dialect, id string, includeHidden bool) (*SessionDetail, error) {
 	var s SessionDetail
 	var metadataJSON string
 	var q strings.Builder
@@ -1545,7 +1549,7 @@ func getSession(db *sql.DB, d Dialect, id string) (*SessionDetail, error) {
 	}
 	_ = json.Unmarshal([]byte(metadataJSON), &s.Metadata)
 
-	msgs, err := sessionMessages(db, d, id)
+	msgs, err := sessionMessages(db, d, id, includeHidden)
 	if err != nil {
 		return nil, err
 	}
@@ -1746,11 +1750,19 @@ func errorContentFromPayload(payload json.RawMessage) string {
 	return "[LLM error] " + p.ResponseBodyExcerpt
 }
 
-func sessionMessages(db *sql.DB, d Dialect, id string) ([]Message, error) {
+func sessionMessages(db *sql.DB, d Dialect, id string, includeHidden bool) ([]Message, error) {
 	// COALESCE(metadata,'') so NULL scans into a Go string (not *string); the
 	// metadata column is nullable and absent on every pre-013 row.
-	rows, err := db.Query(d.Rebind(
-		`SELECT seq, role, content, COALESCE(metadata,''), created_at FROM messages WHERE session_id = ? ORDER BY seq`), id)
+	//
+	// visibility='hidden' rows are system-injected turns dropped from the
+	// user-facing transcript UNLESS the caller opts in: staff analytics pass
+	// include_hidden=true to debug them; the customer chat widget does not.
+	q := `SELECT seq, role, content, COALESCE(metadata,''), created_at FROM messages WHERE session_id = ?`
+	if !includeHidden {
+		q += ` AND (visibility IS NULL OR visibility <> 'hidden')`
+	}
+	q += ` ORDER BY seq`
+	rows, err := db.Query(d.Rebind(q), id)
 	if err != nil {
 		return nil, fmt.Errorf("sessionMessages: %w", err)
 	}
