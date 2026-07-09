@@ -19,7 +19,8 @@ import (
 // review UI, not by the LLM itself. Tool-style data access lives in the
 // sibling mcp-plugin.
 type Handler struct {
-	db      *sql.DB
+	db      *sql.DB // read-only pool — every query endpoint uses this
+	writeDB *sql.DB // read-write pool — the ONLY writer, used solely by the title-update endpoint
 	dialect Dialect
 }
 
@@ -67,6 +68,26 @@ func (h *Handler) Configure(configJSON string) error {
 	}
 	h.db = db
 	h.dialect = dialect
+
+	// Dedicated read-write pool for the single mutating endpoint
+	// (PATCH /sessions/{id}). Opened ONLY when a bearer token is configured: a
+	// mutating endpoint must never run unauthenticated, and authMiddleware
+	// disables auth when the token is empty — so without a token there is simply
+	// no writer and PATCH returns 503. Reads still work token-free for local/dev.
+	// The query pool above stays read-only; least privilege is at the CODE layer
+	// too — exactly one handler, writing exactly one column (title), uses this.
+	if cfg.APIToken != "" {
+		writeDB, _, werr := OpenWriteDB(cfg.DBDriver, cfg.DBDSN)
+		if werr != nil {
+			_ = db.Close()
+			return fmt.Errorf("api-plugin (write pool): %w", werr)
+		}
+		// Rarely used (renames only): bound the extra connections against core's
+		// shared primary, and keep the sqlite writer from lock-storming.
+		writeDB.SetMaxOpenConns(4)
+		writeDB.SetMaxIdleConns(1)
+		h.writeDB = writeDB
+	}
 
 	// Start HTTP server if OPENTALON_HTTP_PORT is set.
 	if port := os.Getenv("OPENTALON_HTTP_PORT"); port != "" {
