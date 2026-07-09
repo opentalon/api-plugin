@@ -42,6 +42,9 @@ func (h *Handler) routes() *http.ServeMux {
 	mux.HandleFunc("GET /health", h.handleHealth)
 	mux.HandleFunc("GET /sessions", h.handleListSessions)
 	mux.HandleFunc("GET /sessions/{id}", h.handleGetSession)
+	// The one mutating route: rename a session (title only). Writes through the
+	// dedicated read-write pool; see handleUpdateSessionTitle.
+	mux.HandleFunc("PATCH /sessions/{id}", h.handleUpdateSessionTitle)
 	mux.HandleFunc("GET /sessions/{id}/events", h.handleSessionEvents)
 	// GET /sessions/{id}/debug-events is the 6th data endpoint, a
 	// deliberate exception to the "five endpoints" cap above: the
@@ -680,6 +683,7 @@ type sessionFilters struct {
 	ExcludeEntityIDs []string // entity_ids to exclude from rows AND aggregation
 	Since            string   // RFC3339, empty = no lower bound
 	Until            string   // RFC3339, empty = no upper bound
+	TitleQuery       string   // case-insensitive substring match on title; empty = no title filter
 }
 
 func filtersFromQuery(r *http.Request) (sessionFilters, error) {
@@ -703,6 +707,19 @@ func filtersFromQuery(r *http.Request) (sessionFilters, error) {
 		Since:            since,
 		Until:            until,
 	}, nil
+}
+
+// maxTitleQuery caps the ?q= title search term. A title is a short label;
+// anything longer is not a real search and would only bloat the LIKE pattern.
+const maxTitleQuery = 200
+
+// titleQueryFromRequest reads and bounds the ?q= session-title search term.
+func titleQueryFromRequest(r *http.Request) string {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if rq := []rune(q); len(rq) > maxTitleQuery {
+		q = string(rq[:maxTitleQuery])
+	}
+	return q
 }
 
 // maxEntityIDList caps the include/exclude_entity_ids lists. Realistic
@@ -913,6 +930,12 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Title search is a /sessions-only filter (only sessions carry titles), so it
+	// is set here rather than in the shared filtersFromQuery that /events and
+	// /events/stats also use. listSessions AND sessionTotals both read f, so the
+	// totals stay consistent with the q-filtered rows.
+	f.TitleQuery = titleQueryFromRequest(r)
+
 	sort, err := sessionSortFromQuery(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -962,6 +985,74 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, sess)
+}
+
+const (
+	// maxTitleLen caps a user-set session title (in runes). Titles are short
+	// labels; the column is TEXT but a sane cap stops an oversized write.
+	maxTitleLen = 200
+	// maxTitleBody caps the PATCH request body so a client can't stream
+	// megabytes into the JSON decoder.
+	maxTitleBody = 4 << 10 // 4 KiB
+)
+
+// handleUpdateSessionTitle renames a session — the api-plugin's single mutating
+// endpoint. It writes ONLY the title column, through the dedicated read-write
+// pool (h.writeDB); every other endpoint stays on the read-only pool. Ownership
+// is enforced upstream (the Rails proxy verifies the session belongs to the
+// actor before forwarding); this layer authenticates the bearer token (via
+// authMiddleware) and validates the payload. The write is unconditional, so a
+// user rename always wins over core's async auto-label — which only fills an
+// empty title (see opentalon SessionStore.SetTitle).
+func (h *Handler) handleUpdateSessionTitle(w http.ResponseWriter, r *http.Request) {
+	// The write pool is opened ONLY when a bearer token is configured (see
+	// Configure): a mutating endpoint must never run unauthenticated. Without a
+	// token there is no writer, so a rename is refused rather than running open.
+	if h.writeDB == nil {
+		writeErr(w, http.StatusServiceUnavailable, "session rename is disabled (no API token configured)")
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "session id required")
+		return
+	}
+
+	var body struct {
+		Title string `json:"title"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTitleBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, `invalid JSON body: expected {"title": "..."}`)
+		return
+	}
+
+	title := strings.TrimSpace(body.Title)
+	if title == "" {
+		writeErr(w, http.StatusBadRequest, "title must not be empty")
+		return
+	}
+	if len([]rune(title)) > maxTitleLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("title too long (max %d characters)", maxTitleLen))
+		return
+	}
+
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	res, err := h.writeDB.Exec(
+		h.dialect.Rebind(`UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?`),
+		title, updatedAt, id)
+	if err != nil {
+		writeServerErr(w, r, "PATCH /sessions/{id}", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	writeJSON(w, map[string]string{"id": id, "title": title, "updated_at": updatedAt})
 }
 
 // handleSessionEvents is the incremental tail-poll endpoint for the
@@ -1279,6 +1370,25 @@ func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
 		q.WriteString(" AND se.ts < ?")
 		*args = append(*args, f.Until)
 	}
+	if f.TitleQuery != "" {
+		// Case-insensitive substring match. Both sides are folded by the SAME
+		// engine LOWER() — NOT Go's Unicode ToLower — so a title and its search
+		// term always agree on the same engine: ASCII-only folding on sqlite,
+		// locale-aware folding on a UTF-8 postgres. (Lowering the term in Go
+		// instead would silently miss accented titles on the sqlite path.)
+		// escapeLike + ESCAPE '\' neutralise %/_ so a term like "50%" matches
+		// literally, not as a wildcard; sqlite has no default escape char, hence
+		// the explicit clause.
+		q.WriteString(` AND LOWER(s.title) LIKE LOWER(?) ESCAPE '\'`)
+		*args = append(*args, "%"+escapeLike(f.TitleQuery)+"%")
+	}
+}
+
+// escapeLike neutralises the LIKE metacharacters (%, _, and the \ escape char)
+// in a user search term so it matches literally inside a %…% pattern. Paired
+// with an explicit ESCAPE '\' clause.
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 // applyEventTypeFilter appends an optional event_type predicate. Lives

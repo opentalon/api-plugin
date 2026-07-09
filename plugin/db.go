@@ -103,11 +103,36 @@ func (d Dialect) DateBucket(column, granularity string) string {
 	return ""
 }
 
-// OpenDB opens a read-only database connection.
+// OpenDB opens the read pool every query endpoint uses. It requests read-only
+// mode as defense-in-depth (sqlite: file-level mode=ro, robust across the whole
+// pool; postgres: a per-connection SET, best-effort — see openDB). The real
+// guarantee is at the CODE layer: query handlers only ever issue SELECTs, and
+// the sole writer is a separate pool (OpenWriteDB).
 func OpenDB(driver, dsn string) (*sql.DB, Dialect, error) {
+	return openDB(driver, dsn, true)
+}
+
+// OpenWriteDB opens a read-WRITE pool on the SAME database — core's own primary
+// (the DSN is injected by the host, so the role already has write grants;
+// api-plugin just declines them everywhere else). Exactly one handler uses this
+// pool — PATCH /sessions/{id}, writing only the title column — so no read path
+// can reach a mutating connection.
+func OpenWriteDB(driver, dsn string) (*sql.DB, Dialect, error) {
+	return openDB(driver, dsn, false)
+}
+
+func openDB(driver, dsn string, readOnly bool) (*sql.DB, Dialect, error) {
 	switch driver {
 	case "sqlite":
-		db, err := sql.Open("sqlite", dsn+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
+		// modernc honours the mode=ro URI parameter ONLY when the filename is a
+		// file: URI — a plain "path?mode=ro" is silently opened read-WRITE. Use the
+		// file: form so the read-only pool is genuinely read-only (file-level, and
+		// so robust across the whole pool, unlike the postgres per-connection SET).
+		params := "?_journal_mode=WAL&_busy_timeout=5000"
+		if readOnly {
+			params = "?mode=ro&_journal_mode=WAL&_busy_timeout=5000"
+		}
+		db, err := sql.Open("sqlite", "file:"+dsn+params)
 		if err != nil {
 			return nil, Dialect{}, fmt.Errorf("open sqlite: %w", err)
 		}
@@ -118,9 +143,15 @@ func OpenDB(driver, dsn string) (*sql.DB, Dialect, error) {
 		if err != nil {
 			return nil, Dialect{}, fmt.Errorf("open postgres: %w", err)
 		}
-		if _, err := db.Exec("SET default_transaction_read_only = true"); err != nil {
-			_ = db.Close()
-			return nil, Dialect{}, fmt.Errorf("set read-only: %w", err)
+		if readOnly {
+			// Best-effort: this SET binds the read-only default to ONE pooled
+			// connection, not the whole pool. Defense-in-depth only — the real
+			// guarantee is that read handlers issue no writes and the sole writer
+			// uses a separate pool (OpenWriteDB).
+			if _, err := db.Exec("SET default_transaction_read_only = true"); err != nil {
+				_ = db.Close()
+				return nil, Dialect{}, fmt.Errorf("set read-only: %w", err)
+			}
 		}
 		return db, postgresDialect, nil
 

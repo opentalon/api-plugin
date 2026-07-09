@@ -136,13 +136,24 @@ func mustUnmarshal(t *testing.T, data []byte, v any) {
 
 func newTestHandler(t *testing.T) *Handler {
 	db, dialect := setupTestDB(t)
-	return &Handler{db: db, dialect: dialect}
+	// The in-memory test DB is writable; point both pools at it so the single
+	// mutating endpoint (PATCH /sessions/{id}) works under test. In production
+	// these are two pools (read-only + read-write) — see Handler.Configure.
+	return &Handler{db: db, writeDB: db, dialect: dialect}
 }
 
 func do(t *testing.T, h *Handler, target string) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
 	h.routes().ServeHTTP(w, httptest.NewRequest("GET", target, nil))
+	return w
+}
+
+// doReq issues an arbitrary method/body request (e.g. PATCH with a JSON body).
+func doReq(t *testing.T, h *Handler, method, target, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	h.routes().ServeHTTP(w, httptest.NewRequest(method, target, strings.NewReader(body)))
 	return w
 }
 
@@ -3191,5 +3202,161 @@ func TestAnnotateAssistantToolCalls_OrdinalStableAcrossSideCalls(t *testing.T) {
 	}
 	if string(msgs[1].ToolCalls) != `[{"id":"tc-2"}]` {
 		t.Fatalf("assistant msg 2 tool_calls = %q, want tc-2 (not the side-call's)", msgs[1].ToolCalls)
+	}
+}
+
+// titleItems decodes /sessions into just (id, title) pairs for the title tests.
+func titleItems(t *testing.T, w *httptest.ResponseRecorder) []struct{ ID, Title string } {
+	t.Helper()
+	var r struct {
+		Items []struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	out := make([]struct{ ID, Title string }, len(r.Items))
+	for i, it := range r.Items {
+		out[i] = struct{ ID, Title string }{it.ID, it.Title}
+	}
+	return out
+}
+
+func TestListSessions_FilterByTitle(t *testing.T) {
+	h := newTestHandler(t)
+
+	// Case-insensitive substring: sess_a has title "First chat title", sess_b
+	// has a NULL title (never matches).
+	w := do(t, h, "/sessions?q=first")
+	mustStatus(t, w, http.StatusOK)
+	if items := titleItems(t, w); len(items) != 1 || items[0].ID != "sess_a" {
+		t.Fatalf("q=first: got %+v, want only sess_a", items)
+	}
+
+	// No match → empty.
+	w = do(t, h, "/sessions?q=zzz-nope")
+	mustStatus(t, w, http.StatusOK)
+	if items := titleItems(t, w); len(items) != 0 {
+		t.Fatalf("q=zzz-nope: got %d items, want 0", len(items))
+	}
+
+	// The LIKE metacharacters '%' (any run) and '_' (any single char) and the
+	// escape char '\' must each match LITERALLY, not as wildcards. No seeded
+	// title contains any of them, so an escaped search returns nothing; a leak
+	// would make '%' or '_' match sess_a. (%25='%', %5F='_', %5C='\'.)
+	for _, meta := range []string{"%25", "%5F", "%5C"} {
+		w = do(t, h, "/sessions?q="+meta)
+		mustStatus(t, w, http.StatusOK)
+		if items := titleItems(t, w); len(items) != 0 {
+			t.Fatalf("q=%s: LIKE metachar leaked, got %d items, want 0", meta, len(items))
+		}
+	}
+}
+
+func TestUpdateSessionTitle(t *testing.T) {
+	h := newTestHandler(t)
+
+	// Rename sess_a (which already has an auto-title) — the write is
+	// unconditional, so the user title wins.
+	w := doReq(t, h, "PATCH", "/sessions/sess_a", `{"title":"Renamed A"}`)
+	mustStatus(t, w, http.StatusOK)
+
+	// The new title is persisted and searchable.
+	w = do(t, h, "/sessions?q=Renamed")
+	mustStatus(t, w, http.StatusOK)
+	if items := titleItems(t, w); len(items) != 1 || items[0].ID != "sess_a" || items[0].Title != "Renamed A" {
+		t.Fatalf("after rename: got %+v, want sess_a titled 'Renamed A'", items)
+	}
+
+	// Whitespace-only title is rejected (empty after trim).
+	mustStatus(t, doReq(t, h, "PATCH", "/sessions/sess_a", `{"title":"   "}`), http.StatusBadRequest)
+
+	// Unknown session id → 404 (zero rows affected).
+	mustStatus(t, doReq(t, h, "PATCH", "/sessions/does-not-exist", `{"title":"X"}`), http.StatusNotFound)
+
+	// Malformed JSON → 400.
+	mustStatus(t, doReq(t, h, "PATCH", "/sessions/sess_a", `{"title":`), http.StatusBadRequest)
+
+	// Unknown field → 400 (DisallowUnknownFields).
+	mustStatus(t, doReq(t, h, "PATCH", "/sessions/sess_a", `{"title":"ok","x":1}`), http.StatusBadRequest)
+
+	// Over the rune cap → 400.
+	mustStatus(t, doReq(t, h, "PATCH", "/sessions/sess_a",
+		`{"title":"`+strings.Repeat("a", maxTitleLen+1)+`"}`), http.StatusBadRequest)
+}
+
+// The title search must never escape the caller's actor scope: q is ANDed with
+// entity_id/group_id, so a client user searching only ever sees their OWN
+// sessions. This is the tenant-isolation guarantee the Rails proxy relies on
+// (it always passes the acting user's entity_id alongside q).
+func TestListSessions_TitleSearchStaysWithinActorScope(t *testing.T) {
+	h := newTestHandler(t)
+
+	// sess_a ("First chat title") belongs to entity_id user_1; sess_b (NULL
+	// title) to user_2. Scoped to user_2, a q=first search must NOT surface
+	// user_1's matching session — q ANDs the scope, it is never a global trawl.
+	w := do(t, h, "/sessions?entity_id=user_2&q=first")
+	mustStatus(t, w, http.StatusOK)
+	if items := titleItems(t, w); len(items) != 0 {
+		t.Fatalf("cross-actor leak: user_2 q=first returned %+v, want none", items)
+	}
+
+	// Scoped to the owner it matches — confirms the AND is a scope, not an over-filter.
+	w = do(t, h, "/sessions?entity_id=user_1&q=first")
+	mustStatus(t, w, http.StatusOK)
+	if items := titleItems(t, w); len(items) != 1 || items[0].ID != "sess_a" {
+		t.Fatalf("owner scope: got %+v, want sess_a", items)
+	}
+}
+
+// The two-pool split is the least-privilege guarantee: the read pool (OpenDB)
+// must physically reject a write, while the write pool (OpenWriteDB) accepts it.
+// Verified on the sqlite path, where read-only (mode=ro) is file-level and holds
+// across the whole pool.
+func TestOpenDB_ReadOnlyRejectsWrites(t *testing.T) {
+	path := t.TempDir() + "/ro.db"
+
+	// Seed via a throwaway read-write handle (default rollback journal), then close.
+	seed, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)`,
+		`INSERT INTO sessions VALUES ('s1','orig')`,
+	} {
+		if _, err := seed.Exec(q); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	_ = seed.Close()
+
+	// Read pool: rejects the write, still serves the read.
+	ro, _, err := OpenDB("sqlite", path)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer func() { _ = ro.Close() }()
+	if _, err := ro.Exec(`UPDATE sessions SET title='hacked' WHERE id='s1'`); err == nil {
+		t.Fatal("read pool accepted a write; want rejection")
+	}
+	var got string
+	if err := ro.QueryRow(`SELECT title FROM sessions WHERE id='s1'`).Scan(&got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != "orig" {
+		t.Fatalf("read got %q, want orig (the rejected write must not have applied)", got)
+	}
+
+	// Write pool: accepts the write.
+	wr, _, err := OpenWriteDB("sqlite", path)
+	if err != nil {
+		t.Fatalf("OpenWriteDB: %v", err)
+	}
+	defer func() { _ = wr.Close() }()
+	if _, err := wr.Exec(`UPDATE sessions SET title='ok' WHERE id='s1'`); err != nil {
+		t.Fatalf("write pool rejected a write: %v", err)
 	}
 }

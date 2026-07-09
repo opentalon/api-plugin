@@ -3,7 +3,7 @@
 [![CI](https://github.com/opentalon/api-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/opentalon/api-plugin/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
 
-Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_snapshots` tables. Primary consumer is the review UI; aggregations are computed JIT in SQL on each request — no aggregator worker, no denormalised counters.
+Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_snapshots` tables, with a single narrow write exception — `PATCH /sessions/{id}` renames a session (title only), through a dedicated read-write pool while every other endpoint stays read-only. Primary consumer is the review UI; aggregations are computed JIT in SQL on each request — no aggregator worker, no denormalised counters.
 
 ## Endpoints
 
@@ -12,6 +12,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 | GET | `/health` | Liveness + DB ping |
 | GET | `/sessions` | Paginated session list, each row with its own JIT-aggregated `stats`, plus `totals` over the full filtered set |
 | GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats` |
+| PATCH | `/sessions/{id}` | Rename a session — updates the `title` column only. The one mutating endpoint; writes through a dedicated read-write pool. Body: `{"title": "..."}` (non-empty, ≤200 chars). Unknown id → 404 |
 | GET | `/sessions/{id}/events` | Incremental tail-poll for one session — events with `seq > since_seq` in ASC order, designed for a 2 s polling loop after the initial `/sessions/{id}` envelope fetch |
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
 | GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions` plus optional `event_type` exact-match, optional `group_by=event_type` + `sample_sessions=N`, optional `bucket_by=day/week/month/year` for time-series |
@@ -39,6 +40,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
   `include_entity_ids` if both are set.
 - `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive. **Filter on event timestamp uniformly across all endpoints**: a session with `created_at` before the window but events inside is included; a session with `created_at` inside the window but events outside is not. Containers vs activity — the API tracks activity.
 - `limit` — page size, default 25, capped at 200. Any value outside `(1..200]` → 400 (matches the strictness of every other cap in the API). To page through more rows, use the returned `next_cursor`.
+- `q` (**`/sessions` only**) — case-insensitive substring match on the session `title`. Sessions with no title yet never match. LIKE metacharacters (`%`, `_`) in the term match literally. Trimmed, capped at 200 chars. Composes with the cursor for paged search.
 
 `/events` adds:
 
@@ -306,8 +308,8 @@ go build -o api-plugin .
 
 ## Supported databases
 
-- SQLite (read-only WAL mode)
-- PostgreSQL (read-only transactions)
+- SQLite (read-only WAL mode; a separate read-write handle backs `PATCH /sessions/{id}`)
+- PostgreSQL (read-only transactions; a separate read-write pool backs `PATCH /sessions/{id}`)
 
 ## Plugin tool surface
 
