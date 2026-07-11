@@ -36,7 +36,7 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			created_at TEXT,
 			updated_at TEXT
 		)`,
-		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, metadata TEXT, created_at TEXT)`,
+		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, metadata TEXT, visibility TEXT, created_at TEXT)`,
 		`CREATE UNIQUE INDEX idx_messages_session_seq ON messages(session_id, seq)`,
 		`CREATE TABLE session_events (
 			id TEXT PRIMARY KEY,
@@ -824,6 +824,39 @@ func TestListSessions_TitleRoundTrip(t *testing.T) {
 		strings.Contains(w.Body.String(), `"id":"sess_b","entity_id":"user_2","group_id":"group_y","title":""`) {
 		t.Errorf("empty title rendered as \"\" instead of being omitted: %s", w.Body.String())
 	}
+}
+
+func TestGetSession_HiddenMessagesAreReaderAware(t *testing.T) {
+	h := newTestHandler(t)
+	// sess_a starts with 2 visible messages; add one hidden system-injected turn.
+	if _, err := h.db.Exec(
+		`INSERT INTO messages (session_id, seq, role, content, visibility, created_at)
+		 VALUES ('sess_a', 3, 'user', '[system] job done', 'hidden', '2024-01-01T10:00:02Z')`); err != nil {
+		t.Fatalf("insert hidden message: %v", err)
+	}
+
+	// Customer view (default): the hidden turn is dropped.
+	w := do(t, h, "/sessions/sess_a")
+	mustStatus(t, w, http.StatusOK)
+	var customer SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &customer)
+	if len(customer.Messages) != 2 {
+		t.Errorf("customer view: got %d messages, want 2 (hidden dropped)", len(customer.Messages))
+	}
+
+	// Staff view: include_hidden=true returns the hidden turn for debugging.
+	w2 := do(t, h, "/sessions/sess_a?include_hidden=true")
+	mustStatus(t, w2, http.StatusOK)
+	var staff SessionDetail
+	mustUnmarshal(t, w2.Body.Bytes(), &staff)
+	if len(staff.Messages) != 3 {
+		t.Errorf("staff view: got %d messages, want 3 (hidden included)", len(staff.Messages))
+	}
+
+	// A malformed include_hidden value is a 400 — never a silent fall-through to
+	// the customer view, which would quietly hide staff's debugging turns.
+	w3 := do(t, h, "/sessions/sess_a?include_hidden=yes")
+	mustStatus(t, w3, http.StatusBadRequest)
 }
 
 func TestGetSession_TitleRoundTrip(t *testing.T) {

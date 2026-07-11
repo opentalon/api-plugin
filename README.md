@@ -11,7 +11,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 |--------|------|-------------|
 | GET | `/health` | Liveness + DB ping |
 | GET | `/sessions` | Paginated session list, each row with its own JIT-aggregated `stats`, plus `totals` over the full filtered set |
-| GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats` |
+| GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats`. `include_hidden=true` also returns system-injected (`visibility='hidden'`) turns — the customer transcript omits them, staff analytics pass it to debug. Accepts literal `true`/`false` only; any other value → 400 |
 | PATCH | `/sessions/{id}` | Rename a session — updates the `title` column only. The one mutating endpoint; writes through a dedicated read-write pool. Body: `{"title": "..."}` (non-empty, ≤200 chars). Unknown id → 404 |
 | GET | `/sessions/{id}/events` | Incremental tail-poll for one session — events with `seq > since_seq` in ASC order, designed for a 2 s polling loop after the initial `/sessions/{id}` envelope fetch |
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
