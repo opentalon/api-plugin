@@ -977,8 +977,13 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// Staff analytics pass include_hidden=true to see system-injected turns for
 	// debugging; the customer chat widget omits it, so hidden turns stay out of
-	// the user-facing transcript.
-	includeHidden := r.URL.Query().Get("include_hidden") == "true"
+	// the user-facing transcript. Parsed via boolFromQuery so a typo is a 400,
+	// not a silent "false" that would quietly show the customer view.
+	includeHidden, err := boolFromQuery(r, "include_hidden", false)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	sess, err := getSession(h.db, h.dialect, id, includeHidden)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

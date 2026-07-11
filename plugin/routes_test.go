@@ -852,6 +852,11 @@ func TestGetSession_HiddenMessagesAreReaderAware(t *testing.T) {
 	if len(staff.Messages) != 3 {
 		t.Errorf("staff view: got %d messages, want 3 (hidden included)", len(staff.Messages))
 	}
+
+	// A malformed include_hidden value is a 400 — never a silent fall-through to
+	// the customer view, which would quietly hide staff's debugging turns.
+	w3 := do(t, h, "/sessions/sess_a?include_hidden=yes")
+	mustStatus(t, w3, http.StatusBadRequest)
 }
 
 func TestGetSession_TitleRoundTrip(t *testing.T) {
