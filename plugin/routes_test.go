@@ -365,6 +365,93 @@ func TestListSessions_SortByCostTotal(t *testing.T) {
 	}
 }
 
+// seedModelRows adds two sessions to the fixture so the model sort has
+// something to order: sess_c carries a distinct model, sess_d has NO model
+// (NULL → ” via COALESCE) to exercise the empty-boundary path. The two
+// fixture rows (sess_a, sess_b) are both 'gpt-4o', which also proves the
+// s.id tiebreak within an equal-model run.
+func seedModelRows(t *testing.T, h *Handler) {
+	t.Helper()
+	if _, err := h.db.Exec(
+		`INSERT INTO sessions (id, active_model, created_at, updated_at) VALUES
+			('sess_c','claude-opus','2024-03-01T10:00:00Z','2024-03-01T10:00:00Z'),
+			('sess_d',NULL,'2024-04-01T10:00:00Z','2024-04-01T10:00:00Z')`); err != nil {
+		t.Fatalf("seed model rows: %v", err)
+	}
+}
+
+func TestListSessions_SortByActiveModel(t *testing.T) {
+	h := newTestHandler(t)
+	seedModelRows(t, h)
+
+	// ASC ⇒ empty model first ('' < 'claude-opus' < 'gpt-4o'), non-decreasing.
+	w := do(t, h, "/sessions?sort=active_model&direction=asc")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var asc SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &asc)
+	if len(asc.Items) != 4 {
+		t.Fatalf("ASC: got %d rows, want 4", len(asc.Items))
+	}
+	if asc.Items[0].ID != "sess_d" {
+		t.Errorf("ASC head = %q (model %q), want sess_d (unset model sorts first)",
+			asc.Items[0].ID, asc.Items[0].ActiveModel)
+	}
+	for i := 1; i < len(asc.Items); i++ {
+		if asc.Items[i-1].ActiveModel > asc.Items[i].ActiveModel {
+			t.Errorf("ASC not sorted at %d: %q > %q", i, asc.Items[i-1].ActiveModel, asc.Items[i].ActiveModel)
+		}
+	}
+
+	// DESC ⇒ mirror: empty model last, non-increasing.
+	w = do(t, h, "/sessions?sort=active_model&direction=desc")
+	var desc SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &desc)
+	if desc.Items[len(desc.Items)-1].ID != "sess_d" {
+		t.Errorf("DESC tail = %q, want sess_d (unset model sorts last)", desc.Items[len(desc.Items)-1].ID)
+	}
+	for i := 1; i < len(desc.Items); i++ {
+		if desc.Items[i-1].ActiveModel < desc.Items[i].ActiveModel {
+			t.Errorf("DESC not sorted at %d: %q < %q", i, desc.Items[i-1].ActiveModel, desc.Items[i].ActiveModel)
+		}
+	}
+}
+
+// TestListSessions_SortByActiveModelCursorWalk pages the non-aggregate
+// active_model sort one row at a time, crossing the NULL-model (”) keyset
+// boundary, to prove cursor pagination visits every row exactly once with
+// no gap or repeat there.
+func TestListSessions_SortByActiveModelCursorWalk(t *testing.T) {
+	h := newTestHandler(t)
+	seedModelRows(t, h)
+
+	var got []string
+	target := "/sessions?sort=active_model&direction=asc&limit=1"
+	for range make([]struct{}, 8) { // hard cap so a pagination bug can't loop forever
+		w := do(t, h, target)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+		}
+		var page SessionListResponse
+		mustUnmarshal(t, w.Body.Bytes(), &page)
+		if len(page.Items) != 1 {
+			t.Fatalf("page size = %d, want 1 (ids so far: %v)", len(page.Items), got)
+		}
+		got = append(got, page.Items[0].ID)
+		if page.NextCursor == "" {
+			break
+		}
+		target = "/sessions?sort=active_model&direction=asc&limit=1&cursor=" + page.NextCursor
+	}
+
+	// '' (sess_d), 'claude-opus' (sess_c), then the two 'gpt-4o' rows by id-asc tiebreak.
+	want := []string{"sess_d", "sess_c", "sess_a", "sess_b"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("cursor walk = %v, want %v", got, want)
+	}
+}
+
 // TestListSessions_SortCursorWalk_Aggregate covers the HAVING-clause branch
 // of cursor pagination — without it, the cursor predicate would land in
 // WHERE and the boundary value (which only exists after GROUP BY) would
