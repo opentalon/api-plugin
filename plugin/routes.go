@@ -737,6 +737,7 @@ const maxEntityIDList = 200
 const (
 	sortKeyCreatedAt     = "created_at"
 	sortKeyUpdatedAt     = "updated_at"
+	sortKeyActiveModel   = "active_model"
 	sortKeyCostTotal     = "cost_total"
 	sortKeyLLMCallCount  = "llm_call_count"
 	sortKeyToolCallCount = "tool_call_count"
@@ -782,12 +783,12 @@ func sessionSortFromQuery(r *http.Request) (sessionSort, error) {
 		d = defaultSessionSort.Direction
 	}
 	switch s {
-	case sortKeyCreatedAt, sortKeyUpdatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
+	case sortKeyCreatedAt, sortKeyUpdatedAt, sortKeyActiveModel, sortKeyCostTotal, sortKeyLLMCallCount,
 		sortKeyToolCallCount, sortKeyTokensIn, sortKeyTokensOut:
 	default:
 		return sessionSort{}, fmt.Errorf(
-			"sort: unsupported key %q (allowed: %s, %s, %s, %s, %s, %s, %s)",
-			s, sortKeyCreatedAt, sortKeyUpdatedAt, sortKeyCostTotal, sortKeyLLMCallCount,
+			"sort: unsupported key %q (allowed: %s, %s, %s, %s, %s, %s, %s, %s)",
+			s, sortKeyCreatedAt, sortKeyUpdatedAt, sortKeyActiveModel, sortKeyCostTotal, sortKeyLLMCallCount,
 			sortKeyToolCallCount, sortKeyTokensIn, sortKeyTokensOut)
 	}
 	switch d {
@@ -812,6 +813,16 @@ func resolveSessionSort(s sessionSort, d Dialect) sessionSortDef {
 	case sortKeyUpdatedAt:
 		def.Expr = "s.updated_at"
 		def.Extract = func(r SessionListItem) string { return r.UpdatedAt }
+		def.BindValue = func(raw string) (any, error) { return raw, nil }
+	case sortKeyActiveModel:
+		// Plain per-row column (not an aggregate), so the cursor predicate
+		// lives in WHERE like created_at/updated_at. active_model is nullable;
+		// COALESCE to '' so the ORDER BY + keyset boundary compare against the
+		// same value the row projection (SELECT COALESCE(s.active_model,''))
+		// scans into ActiveModel — NULL-model rows then paginate without gaps
+		// or repeats at the page boundary.
+		def.Expr = "COALESCE(s.active_model,'')"
+		def.Extract = func(r SessionListItem) string { return r.ActiveModel }
 		def.BindValue = func(raw string) (any, error) { return raw, nil }
 	case sortKeyCostTotal:
 		def.Expr = llmAggExpr(d, payloadFieldCostInput, false) + " + " + llmAggExpr(d, payloadFieldCostOutput, false)
