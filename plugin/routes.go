@@ -158,13 +158,31 @@ type SessionDetail struct {
 // action) that a chat client uses to rebuild the confirmation UI after a
 // reload. It is inlined raw and omitted when the column is NULL, so rows
 // without metadata stay byte-identical to the pre-013 contract.
+//
+// ToolCallID is the stored messages.tool_call_id column — the provider's
+// call id ("chatcmpl-tool-…") that Core stamps on every role:"tool" result
+// row it writes on the native-tool-calling path. It is the ONLY field that
+// joins a transcript row to its session_events counterpart: both
+// tool_call_extracted and tool_call_result carry the same value as
+// payload.call_id. Neither seq nor created_at can serve that purpose —
+// the messages and session_events tables maintain independent seq
+// sequences (see annotateAssistantToolCalls) and messages.created_at is
+// written at second precision against microsecond event timestamps (see
+// mergeErrorMessages). Consumers that need to pair a tool result with the
+// events that produced it must use this field.
+//
+// Empty on every other row: user/assistant rows never carry one, and the
+// text-based (non-native) tool-calling path stores its results as ordinary
+// user rows with no id at all. omitempty keeps those byte-identical to the
+// pre-existing contract.
 type Message struct {
-	Seq       int             `json:"seq"`
-	Role      string          `json:"role"`
-	Content   string          `json:"content"`
-	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
-	Metadata  json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt string          `json:"created_at"`
+	Seq        int             `json:"seq"`
+	Role       string          `json:"role"`
+	Content    string          `json:"content"`
+	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt  string          `json:"created_at"`
 }
 
 // Event is one row of session_events. Payload is inlined as a raw JSON
@@ -1773,7 +1791,9 @@ func sessionMessages(db *sql.DB, d Dialect, id string, includeHidden bool) ([]Me
 	// visibility='hidden' rows are system-injected turns dropped from the
 	// user-facing transcript UNLESS the caller opts in: staff analytics pass
 	// include_hidden=true to debug them; the customer chat widget does not.
-	q := `SELECT seq, role, content, COALESCE(metadata,''), created_at FROM messages WHERE session_id = ?`
+	// COALESCE(tool_call_id,'') for the same reason: the column is nullable
+	// and NULL on every row that is not a native-path tool result.
+	q := `SELECT seq, role, content, COALESCE(metadata,''), COALESCE(tool_call_id,''), created_at FROM messages WHERE session_id = ?`
 	if !includeHidden {
 		q += ` AND (visibility IS NULL OR visibility <> 'hidden')`
 	}
@@ -1788,7 +1808,7 @@ func sessionMessages(db *sql.DB, d Dialect, id string, includeHidden bool) ([]Me
 	for rows.Next() {
 		var m Message
 		var metadata string
-		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &metadata, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &metadata, &m.ToolCallID, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("sessionMessages scan: %w", err)
 		}
 		// Inline the raw JSON only when present and non-empty — mirror the

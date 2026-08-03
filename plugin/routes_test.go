@@ -36,7 +36,7 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			created_at TEXT,
 			updated_at TEXT
 		)`,
-		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, metadata TEXT, visibility TEXT, created_at TEXT)`,
+		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, tool_call_id TEXT, metadata TEXT, visibility TEXT, created_at TEXT)`,
 		`CREATE UNIQUE INDEX idx_messages_session_seq ON messages(session_id, seq)`,
 		`CREATE TABLE session_events (
 			id TEXT PRIMARY KEY,
@@ -1122,6 +1122,57 @@ func TestGetSession_MessageMetadataPassthrough(t *testing.T) {
 	// inflate the count.
 	if n := strings.Count(w.Body.String(), `"metadata":`); n != 2 {
 		t.Errorf("metadata JSON key appears %d times, want 2; body = %s", n, w.Body.String())
+	}
+}
+
+// TestGetSession_ToolCallIDPassthrough pins the messages.tool_call_id column
+// on the response. It is the only field that joins a transcript row to the
+// session_events rows that produced it — tool_call_extracted and
+// tool_call_result carry the same value as payload.call_id — so a consumer
+// rendering a paired conversation/event-log view depends on it being present
+// and exact. Two tool rounds are seeded because the failure this guards
+// against only appears from the second round onwards: with a single round any
+// positional guess happens to land right.
+func TestGetSession_ToolCallIDPassthrough(t *testing.T) {
+	h := newTestHandler(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	exec(`INSERT INTO sessions VALUES ('sess_tc','tc session',NULL,'gpt-oss-120b','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',1,'user','history please','2024-08-01T10:00:00Z')`)
+	// Round 1: empty-content assistant dispatch + its tool result. gpt-oss
+	// writes the dispatch row with no content, which is exactly why the row
+	// itself carries no usable signal and the id on the result row matters.
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',2,'assistant','','2024-08-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, tool_call_id, created_at) VALUES ('sess_tc',3,'tool','no hits','chatcmpl-tool-aaa','2024-08-01T10:00:01Z')`)
+	// Round 2: same wall-clock second as round 1's result — second-precision
+	// created_at cannot separate them, the id can.
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',4,'assistant','','2024-08-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, tool_call_id, created_at) VALUES ('sess_tc',5,'tool','1 hit','chatcmpl-tool-bbb','2024-08-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',6,'assistant','Here is the history.','2024-08-01T10:00:02Z')`)
+
+	w := do(t, h, "/sessions/sess_tc")
+	mustStatus(t, w, http.StatusOK)
+	var s SessionDetail
+	mustUnmarshal(t, w.Body.Bytes(), &s)
+
+	if len(s.Messages) != 6 {
+		t.Fatalf("got %d messages, want 6", len(s.Messages))
+	}
+	for i, want := range []string{"", "", "chatcmpl-tool-aaa", "", "chatcmpl-tool-bbb", ""} {
+		if got := s.Messages[i].ToolCallID; got != want {
+			t.Errorf("message[%d] (role %q) tool_call_id = %q, want %q", i, s.Messages[i].Role, got, want)
+		}
+	}
+
+	// omitempty contract: the key appears only on the two tool-result rows, so
+	// every other row stays byte-identical to the pre-change response.
+	if n := strings.Count(w.Body.String(), `"tool_call_id":`); n != 2 {
+		t.Errorf("tool_call_id JSON key appears %d times, want 2; body = %s", n, w.Body.String())
 	}
 }
 
