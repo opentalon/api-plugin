@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -34,7 +35,15 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			entity_id TEXT DEFAULT '',
 			group_id TEXT DEFAULT '',
 			created_at TEXT,
-			updated_at TEXT
+			updated_at TEXT,
+			-- Mirrors opentalon migrations 014 and 016, which ALTER the live
+			-- table: interaction_kind is NOT NULL DEFAULT 'chat' (every existing
+			-- row backfilled), system_source is nullable and stays NULL unless a
+			-- feature opened the session. Appended last, exactly as the ALTERs
+			-- append them, so the positional INSERTs below end with
+			-- ('chat', NULL) — an ordinary, unlabelled chat session.
+			interaction_kind TEXT NOT NULL DEFAULT 'chat',
+			system_source TEXT
 		)`,
 		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, tool_call_id TEXT, metadata TEXT, visibility TEXT, created_at TEXT)`,
 		`CREATE UNIQUE INDEX idx_messages_session_seq ON messages(session_id, seq)`,
@@ -91,8 +100,8 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 	// with priced payloads; Session B (newer) has 1 llm_response + 1
 	// tool_call_result. Time stamps are chosen so created_at DESC gives B
 	// first and the cursor test below can walk forward into A.
-	exec(`INSERT INTO sessions VALUES ('sess_a','first session','First chat title','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z')`)
-	exec(`INSERT INTO sessions VALUES ('sess_b','second session',NULL,'gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_a','first session','First chat title','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_b','second session',NULL,'gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z','chat',NULL)`)
 
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_a',1,'user','hi','2024-01-01T10:00:00Z')`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_a',2,'assistant','hello','2024-01-01T10:00:01Z')`)
@@ -1018,7 +1027,7 @@ func TestGetSession_ToolCallsPassthrough(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_tc','tool-call session',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_tc','tool-call session',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z','chat',NULL)`)
 
 	// user → assistant tool-call-only → tool → assistant text answer.
 	// The first assistant row has empty content (the LLM only emitted
@@ -1083,7 +1092,7 @@ func TestGetSession_MessageMetadataPassthrough(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_md','md session',NULL,'gpt-4o','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_md','md session',NULL,'gpt-4o','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z','chat',NULL)`)
 	// Plain user turn (NULL metadata) → key omitted.
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_md',1,'user','delete 3 items','2024-08-01T10:00:00Z')`)
 	// Assistant confirmation prompt carries the tool-confirmation marker.
@@ -1142,7 +1151,7 @@ func TestGetSession_ToolCallIDPassthrough(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_tc','tc session',NULL,'gpt-oss-120b','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_tc','tc session',NULL,'gpt-oss-120b','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z','chat',NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',1,'user','history please','2024-08-01T10:00:00Z')`)
 	// Round 1: empty-content assistant dispatch + its tool result. gpt-oss
 	// writes the dispatch row with no content, which is exactly why the row
@@ -1188,7 +1197,7 @@ func TestGetSession_MalformedMessageMetadataDropped(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_bad','bad md',NULL,'gpt-4o','{}','user_6','group_z','2024-08-02T10:00:00Z','2024-08-02T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bad','bad md',NULL,'gpt-4o','{}','user_6','group_z','2024-08-02T10:00:00Z','2024-08-02T10:30:00Z','chat',NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, metadata, created_at) VALUES ('sess_bad',1,'assistant','x','not json','2024-08-02T10:00:00Z')`)
 
 	w := do(t, h, "/sessions/sess_bad")
@@ -1219,7 +1228,7 @@ func TestGetSession_EmptyToolCallsOmitted(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc',NULL,'gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc',NULL,'gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z','chat',NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',1,'user','hi','2024-03-02T10:00:00Z')`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',2,'assistant','hello','2024-03-02T10:00:01Z')`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',3,'assistant','again','2024-03-02T10:00:02Z')`)
@@ -1259,7 +1268,7 @@ func TestGetSession_SynthesisesErrorRowFromLLMError(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_err','failed turn',NULL,'gpt-4o','{}','user_4','group_z','2024-04-01T10:00:00Z','2024-04-01T10:00:05Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_err','failed turn',NULL,'gpt-4o','{}','user_4','group_z','2024-04-01T10:00:00Z','2024-04-01T10:00:05Z','chat',NULL)`)
 
 	// Only the user message exists — the LLM call errored before any
 	// assistant row could be written.
@@ -1330,7 +1339,7 @@ func TestGetSession_ErrorRowInterleavedByTimestamp(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session',NULL,'gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session',NULL,'gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z','chat',NULL)`)
 
 	// Turn 1: user → assistant (successful).
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_mix',1,'user','hi','2024-05-01T10:00:00Z')`)
@@ -1382,7 +1391,7 @@ func TestGetSession_PrecisionMismatchOrdersErrorAfterMessage(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_prec','precision session',NULL,'gpt-4o','{}','user_7','group_z','2024-07-01T10:00:00Z','2024-07-01T10:00:05Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_prec','precision session',NULL,'gpt-4o','{}','user_7','group_z','2024-07-01T10:00:00Z','2024-07-01T10:00:05Z','chat',NULL)`)
 
 	// Real-world shape: user message at second precision, llm_error at
 	// microsecond precision within the same wall-clock second. The
@@ -1421,7 +1430,7 @@ func TestGetSession_ErrorContentFallback(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session',NULL,'gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session',NULL,'gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z','chat',NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_fb',1,'user','q','2024-06-01T10:00:00Z')`)
 	// Payload is valid JSON but has no response_body_excerpt — must fall back.
 	exec(`INSERT INTO session_events VALUES ('evt_fb1','sess_fb',1,'2024-06-01T10:00:02Z','llm_error',NULL,0,'{"v":1,"phase":"chat.parse"}','2024-06-01T10:00:02Z')`)
@@ -1780,7 +1789,7 @@ func TestEventsStats_GroupBy_SampleSessionsRespectsLimit(t *testing.T) {
 	// three distinct sessions. Most-recent timestamp goes to sess_c so
 	// we can also confirm it lands at index 0 under N=2.
 	if _, err := h.db.Exec(
-		`INSERT INTO sessions VALUES ('sess_c','third',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z')`); err != nil {
+		`INSERT INTO sessions VALUES ('sess_c','third',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z','chat',NULL)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.db.Exec(
@@ -1890,7 +1899,7 @@ func TestEventsStats_GroupBy_SampleSessionIDsTiebreaker(t *testing.T) {
 	const sameTS = "2024-04-01T10:00:00Z"
 	for _, sid := range []string{"sess_beta", "sess_alpha"} {
 		if _, err := h.db.Exec(
-			`INSERT INTO sessions VALUES (?,'tie',NULL,'gpt-4o','{}','user_tie','group_tie',?,?)`,
+			`INSERT INTO sessions VALUES (?,'tie',NULL,'gpt-4o','{}','user_tie','group_tie',?,?,'chat',NULL)`,
 			sid, sameTS, sameTS); err != nil {
 			t.Fatal(err)
 		}
@@ -2006,26 +2015,26 @@ func seedBucketEvents(t *testing.T, db *sql.DB) {
 			tokIn, tokOut, costIn, costOut)
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','',NULL,'gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','',NULL,'gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a1','sess_bk_alice',1,'2026-05-10T10:00:00Z','llm_response',NULL,100,?,'2026-05-10T10:00:00Z')`,
 		llm(100, 50, 0.010, 0.020))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a2','sess_bk_alice',2,'2026-05-12T10:00:00Z','llm_response',NULL,100,?,'2026-05-12T10:00:00Z')`,
 		llm(200, 100, 0.020, 0.040))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','',NULL,'gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','',NULL,'gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b1','sess_bk_bob',1,'2026-05-14T10:00:00Z','llm_response',NULL,200,?,'2026-05-14T10:00:00Z')`,
 		llm(300, 150, 0.030, 0.060))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b2','sess_bk_bob',2,'2026-05-14T11:00:00Z','tool_call_result','evt_bk_b1',50,'{"v":1,"result":"ok"}','2026-05-14T11:00:00Z')`)
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','',NULL,'gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','',NULL,'gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_c1','sess_bk_carol',1,'2026-05-16T10:00:00Z','llm_response',NULL,100,?,'2026-05-16T10:00:00Z')`,
 		llm(400, 200, 0.040, 0.080))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_dave','',NULL,'gpt-4o','{}','u_dave','acme','2026-06-03T09:00:00Z','2026-06-03T10:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_dave','',NULL,'gpt-4o','{}','u_dave','acme','2026-06-03T09:00:00Z','2026-06-03T10:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_d1','sess_bk_dave',1,'2026-06-03T10:00:00Z','llm_response',NULL,100,?,'2026-06-03T10:00:00Z')`,
 		llm(500, 250, 0.050, 0.100))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_ed','',NULL,'gpt-4o','{}','u_ed','acme','2025-07-15T09:00:00Z','2025-07-15T10:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_ed','',NULL,'gpt-4o','{}','u_ed','acme','2025-07-15T09:00:00Z','2025-07-15T10:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_e1','sess_bk_ed',1,'2025-07-15T10:00:00Z','llm_response',NULL,100,?,'2025-07-15T10:00:00Z')`,
 		llm(600, 300, 0.060, 0.120))
 }
@@ -2572,12 +2581,12 @@ func seedSpanningSessions(t *testing.T, db *sql.DB) {
 	}
 
 	// Container created APRIL, event in MAY — under se.ts contract, IN window.
-	exec(`INSERT INTO sessions VALUES ('sess_span_inside','',NULL,'gpt-4o','{}','u_ts_inside','tsax','2026-04-30T23:00:00Z','2026-05-15T11:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_span_inside','',NULL,'gpt-4o','{}','u_ts_inside','tsax','2026-04-30T23:00:00Z','2026-05-15T11:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_ts_inside','sess_span_inside',1,'2026-05-15T10:00:00Z','llm_response',NULL,100,?,'2026-05-15T10:00:00Z')`,
 		llm(700, 350, 0.070, 0.140))
 
 	// Container created MAY, event in APRIL — under se.ts contract, OUT of window.
-	exec(`INSERT INTO sessions VALUES ('sess_span_outside','',NULL,'gpt-4o','{}','u_ts_outside','tsax','2026-05-05T09:00:00Z','2026-05-05T10:00:00Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_span_outside','',NULL,'gpt-4o','{}','u_ts_outside','tsax','2026-05-05T09:00:00Z','2026-05-05T10:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_ts_outside','sess_span_outside',1,'2026-04-10T10:00:00Z','llm_response',NULL,100,?,'2026-04-10T10:00:00Z')`,
 		llm(800, 400, 0.080, 0.160))
 }
@@ -3130,7 +3139,7 @@ func TestSessionEvents_LimitBoundaryAndBurstSemantics(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_burst','burst',NULL,'gpt-4o','{}','user_b','group_b','2024-05-19T00:00:00Z','2024-05-19T00:00:30Z')`)
+	exec(`INSERT INTO sessions VALUES ('sess_burst','burst',NULL,'gpt-4o','{}','user_b','group_b','2024-05-19T00:00:00Z','2024-05-19T00:00:30Z','chat',NULL)`)
 	// Seed 30 events with seq=1..30. Insert in a non-sorted order to
 	// ensure the ORDER BY clause is doing the work, not the insertion order.
 	insertOrder := []int{15, 7, 1, 22, 30, 14, 3, 18, 9, 26, 5, 12, 20, 28, 2, 17, 24, 8, 19, 4, 21, 11, 27, 6, 13, 25, 10, 16, 29, 23}
@@ -3529,5 +3538,353 @@ func TestOpenDB_ReadOnlyRejectsWrites(t *testing.T) {
 	defer func() { _ = wr.Close() }()
 	if _, err := wr.Exec(`UPDATE sessions SET title='ok' WHERE id='s1'`); err != nil {
 		t.Fatalf("write pool rejected a write: %v", err)
+	}
+}
+
+// --- interaction_kind / system_source (opentalon-core migrations 014, 016) ---
+
+// seedLabelledSessions adds the two system-run rows the labelling tests need,
+// on top of the fixture's two ordinary chat sessions (sess_a, sess_b, both
+// 'chat' with no source). Two different sources so a source filter has to
+// discriminate rather than just separating "system" from "chat". sess_sys_map
+// carries one event so /events can be filtered by kind too.
+func seedLabelledSessions(t *testing.T, h *Handler) {
+	t.Helper()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed labelled sessions: %v", err)
+		}
+	}
+	exec(`INSERT INTO sessions (id, entity_id, group_id, created_at, updated_at, interaction_kind, system_source) VALUES
+		('sess_sys_map','user_1','group_x','2024-03-01T10:00:00Z','2024-03-01T10:00:00Z','system','csv_mapping'),
+		('sess_sys_job','user_1','group_x','2024-04-01T10:00:00Z','2024-04-01T10:00:00Z','system','job_notify')`)
+	exec(`INSERT INTO session_events VALUES ('evt_sys_map1','sess_sys_map',1,'2024-03-01T10:00:01Z','llm_response',NULL,10,
+		'{"v":1,"tokens_in":10,"tokens_out":5,"cost_input":0.001,"cost_output":0.002}','2024-03-01T10:00:01Z')`)
+}
+
+// Every row carries both labels, and both keys are present even when the
+// value is empty — a consumer must be able to tell "no feature label" from
+// "a plugin build that predates the field".
+func TestListSessions_ReturnsKindAndSystemSource(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	w := do(t, h, "/sessions")
+	mustStatus(t, w, http.StatusOK)
+	var resp SessionListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+
+	got := make(map[string][2]string, len(resp.Items))
+	for _, it := range resp.Items {
+		got[it.ID] = [2]string{it.InteractionKind, it.SystemSource}
+	}
+	want := map[string][2]string{
+		"sess_a":       {"chat", ""},
+		"sess_b":       {"chat", ""},
+		"sess_sys_map": {"system", "csv_mapping"},
+		"sess_sys_job": {"system", "job_notify"},
+	}
+	for id, labels := range want {
+		if got[id] != labels {
+			t.Errorf("%s: (interaction_kind, system_source) = %v, want %v", id, got[id], labels)
+		}
+	}
+
+	// The unlabelled chat rows must still SHOW an empty system_source rather
+	// than omitting the key; assert on the wire bytes, since the decoded
+	// struct cannot tell an absent key from an empty string.
+	var raw struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	mustUnmarshal(t, w.Body.Bytes(), &raw)
+	for _, item := range raw.Items {
+		for _, key := range []string{"interaction_kind", "system_source"} {
+			if _, ok := item[key]; !ok {
+				t.Errorf("row %s: %q missing from the JSON body", item["id"], key)
+			}
+		}
+	}
+}
+
+// Each filter narrows on its own and the two AND together. Totals are asserted
+// alongside the rows: a caller that scopes a list by kind must not see a
+// session_count computed over a wider set.
+func TestListSessions_FilterByKindAndSystemSource(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"kind=chat hides system runs", "?kind=chat", []string{"sess_b", "sess_a"}},
+		{"kind=system keeps only them", "?kind=system", []string{"sess_sys_job", "sess_sys_map"}},
+		{"system_source picks one feature", "?system_source=csv_mapping", []string{"sess_sys_map"}},
+		{"both filters AND together", "?kind=system&system_source=job_notify", []string{"sess_sys_job"}},
+		{"source with the wrong kind matches nothing", "?kind=chat&system_source=csv_mapping", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(t, h, "/sessions"+tc.query)
+			mustStatus(t, w, http.StatusOK)
+			var resp SessionListResponse
+			mustUnmarshal(t, w.Body.Bytes(), &resp)
+			if ids := itemIDs(resp.Items); !slices.Equal(ids, tc.want) {
+				t.Fatalf("ids = %v, want %v", ids, tc.want)
+			}
+			if resp.Totals.SessionCount != len(tc.want) {
+				t.Errorf("totals.session_count = %d, want %d (totals must describe the filtered set)",
+					resp.Totals.SessionCount, len(tc.want))
+			}
+		})
+	}
+}
+
+// Both columns are extensible string enums in core, so the plugin treats every
+// value as opaque: an unknown one narrows to nothing instead of 400. Rejecting
+// it would break every caller on the day core starts writing a new label.
+func TestListSessions_UnknownKindOrSourceIsEmptyNotError(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	for _, query := range []string{
+		"?kind=banana",
+		"?system_source=no_such_feature",
+		"?kind=system&system_source=no_such_feature",
+	} {
+		w := do(t, h, "/sessions"+query)
+		mustStatus(t, w, http.StatusOK)
+		var resp SessionListResponse
+		mustUnmarshal(t, w.Body.Bytes(), &resp)
+		if len(resp.Items) != 0 {
+			t.Errorf("%s: got %v, want no rows", query, itemIDs(resp.Items))
+		}
+		if resp.Totals.SessionCount != 0 {
+			t.Errorf("%s: totals.session_count = %d, want 0", query, resp.Totals.SessionCount)
+		}
+	}
+}
+
+// Both filters come from the SHARED filtersFromQuery, so they also reach
+// /events and /events/stats. /events picks its query shape from needJoin: on
+// the no-JOIN fast path the shared builder is skipped entirely, so a filter
+// missing from that gate is silently ignored rather than failing loudly.
+// Asserted on the returned rows, never on the status code, for that reason.
+func TestEvents_FilterByKindForcesSessionsJoin(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	w := do(t, h, "/events?kind=system")
+	mustStatus(t, w, http.StatusOK)
+	var resp EventListResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Items) != 1 || resp.Items[0].ID != "evt_sys_map1" {
+		t.Fatalf("/events?kind=system: got %+v, want just evt_sys_map1", resp.Items)
+	}
+
+	w = do(t, h, "/events/stats?system_source=csv_mapping")
+	mustStatus(t, w, http.StatusOK)
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+	if stats.SessionCount != 1 {
+		t.Fatalf("/events/stats?system_source=csv_mapping: session_count = %d, want 1", stats.SessionCount)
+	}
+}
+
+// /events?system_source=… has exactly one guard: the needJoin gate. The stats
+// endpoint always joins sessions, so a gate that lost system_source would keep
+// every other test green while this call answered every event of every
+// feature. Unknown values answer an empty 200 here as on /sessions.
+func TestEvents_FilterBySystemSourceForcesSessionsJoin(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	for _, tc := range []struct {
+		query string
+		want  []string
+	}{
+		{"?system_source=csv_mapping", []string{"evt_sys_map1"}},
+		{"?system_source=job_notify", nil}, // labelled session, no events
+		{"?kind=chat&system_source=csv_mapping", nil},
+		{"?system_source=no_such_feature", nil},
+		{"?kind=banana", nil},
+	} {
+		w := do(t, h, "/events"+tc.query)
+		mustStatus(t, w, http.StatusOK)
+		var resp EventListResponse
+		mustUnmarshal(t, w.Body.Bytes(), &resp)
+		ids := make([]string, 0, len(resp.Items))
+		for _, e := range resp.Items {
+			ids = append(ids, e.ID)
+		}
+		if !slices.Equal(ids, tc.want) {
+			t.Errorf("/events%s: ids = %v, want %v", tc.query, ids, tc.want)
+		}
+	}
+}
+
+// /events/stats has four query shapes — plain totals, group_by=event_type
+// (with sample_sessions), and bucket_by — each its own SQL through the shared
+// builder. Every shape is asserted under a kind filter so none can quietly
+// stop honouring it. session_count counts sessions, with or without events,
+// so the eventless sess_sys_job is in it while every counter reflects only
+// sess_sys_map's single llm_response.
+func TestEventsStats_KindFilterReachesEveryShape(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+	fetch := func(query string) EventStats {
+		t.Helper()
+		w := do(t, h, "/events/stats"+query)
+		mustStatus(t, w, http.StatusOK)
+		var stats EventStats
+		mustUnmarshal(t, w.Body.Bytes(), &stats)
+		return stats
+	}
+
+	totals := fetch("?kind=system")
+	if totals.SessionCount != 2 || totals.EventCount != 1 || totals.LLMCallCount != 1 || totals.ToolCallCount != 0 ||
+		totals.TokensInTotal != 10 || totals.TokensOutTotal != 5 ||
+		totals.CostInputTotal != 0.001 || totals.CostOutputTotal != 0.002 {
+		t.Errorf("totals under kind=system = %+v, want sess_sys_map's one llm_response only", totals)
+	}
+
+	byType := fetch("?kind=system&group_by=event_type&sample_sessions=3")
+	if len(byType.ByEventType) != 1 || byType.ByEventType[0].EventType != "llm_response" ||
+		byType.ByEventType[0].Count != 1 ||
+		!slices.Equal(byType.ByEventType[0].SampleSessionIDs, []string{"sess_sys_map"}) {
+		t.Errorf("group_by under kind=system = %+v, want one llm_response bucket sampled from sess_sys_map", byType.ByEventType)
+	}
+
+	buckets := fetch("?kind=system&bucket_by=day&since=2024-03-01T00:00:00Z&until=2024-03-02T00:00:00Z")
+	if len(buckets.TimeBuckets) != 1 || buckets.TimeBuckets[0].Bucket != "2024-03-01" ||
+		buckets.TimeBuckets[0].EventCount != 1 || buckets.TimeBuckets[0].TokensInTotal != 10 {
+		t.Errorf("bucket_by under kind=system = %+v, want one 2024-03-01 bucket with the single event", buckets.TimeBuckets)
+	}
+
+	none := fetch("?kind=system&system_source=no_such_feature")
+	if none.SessionCount != 0 || none.EventCount != 0 {
+		t.Errorf("unknown source: stats = %+v, want all zero", none)
+	}
+}
+
+// A kind filter has to survive into every later page: the cursor query adds a
+// HAVING clause on top of the same builder, and a later page widening to chat
+// rows would be invisible to an unpaged test. Walked under a column sort and
+// under an aggregate sort, which take different SQL shapes.
+func TestListSessions_FilteredCursorPagination(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"created_at desc", "?kind=system&limit=1", []string{"sess_sys_job", "sess_sys_map"}},
+		{"llm_call_count desc", "?kind=system&limit=1&sort=llm_call_count&direction=desc",
+			[]string{"sess_sys_map", "sess_sys_job"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			cursor := ""
+			for range len(tc.want) + 1 {
+				w := do(t, h, "/sessions"+tc.query+cursor)
+				mustStatus(t, w, http.StatusOK)
+				var resp SessionListResponse
+				mustUnmarshal(t, w.Body.Bytes(), &resp)
+				if len(resp.Items) != 1 {
+					t.Fatalf("page after %q: got %v, want exactly one row", cursor, itemIDs(resp.Items))
+				}
+				got = append(got, resp.Items[0].ID)
+				if resp.NextCursor == "" {
+					break
+				}
+				cursor = "&cursor=" + resp.NextCursor
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("pages = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The contract for the two opaque values, pinned: an empty value is the same
+// as leaving the parameter out (so it cannot select the NULL-source rows),
+// surrounding whitespace is trimmed, and case is significant.
+func TestListSessions_LabelFilterValueContract(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"empty values are no filter", "?kind=&system_source=", []string{"sess_sys_job", "sess_sys_map", "sess_b", "sess_a"}},
+		{"whitespace is trimmed", "?kind=%20system%20", []string{"sess_sys_job", "sess_sys_map"}},
+		{"case matters", "?kind=CHAT", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(t, h, "/sessions"+tc.query)
+			mustStatus(t, w, http.StatusOK)
+			var resp SessionListResponse
+			mustUnmarshal(t, w.Body.Bytes(), &resp)
+			if ids := itemIDs(resp.Items); !slices.Equal(ids, tc.want) {
+				t.Errorf("ids = %v, want %v", ids, tc.want)
+			}
+		})
+	}
+}
+
+// The detail endpoint carries the same pair, so a consumer landing on one
+// session directly can tell a system run from a conversation; both keys are
+// on the wire even when empty.
+func TestGetSession_ReturnsKindAndSystemSource(t *testing.T) {
+	h := newTestHandler(t)
+	seedLabelledSessions(t, h)
+
+	for id, want := range map[string][2]string{
+		"sess_sys_map": {"system", "csv_mapping"},
+		"sess_a":       {"chat", ""},
+	} {
+		w := do(t, h, "/sessions/"+id)
+		mustStatus(t, w, http.StatusOK)
+		var d SessionDetail
+		mustUnmarshal(t, w.Body.Bytes(), &d)
+		if got := [2]string{d.InteractionKind, d.SystemSource}; got != want {
+			t.Errorf("%s: (interaction_kind, system_source) = %v, want %v", id, got, want)
+		}
+		var raw map[string]json.RawMessage
+		mustUnmarshal(t, w.Body.Bytes(), &raw)
+		for _, key := range []string{"interaction_kind", "system_source"} {
+			if _, ok := raw[key]; !ok {
+				t.Errorf("%s: %q missing from the JSON body", id, key)
+			}
+		}
+	}
+}
+
+// A store that predates core migration 016 makes every /sessions call fail
+// with a generic 500. /health must not stay green over that: it probes the
+// two label columns and reports the store as behind, with the reason.
+func TestHealth_StoreBehindCoreMigration(t *testing.T) {
+	h := newTestHandler(t)
+	if _, err := h.db.Exec(`ALTER TABLE sessions DROP COLUMN system_source`); err != nil {
+		t.Fatalf("drop column to simulate a pre-016 store: %v", err)
+	}
+
+	w := do(t, h, "/health")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "migration 016") {
+		t.Errorf("body should name the missing migration, got %s", w.Body.String())
+	}
+
+	// The list endpoint really is down on that store — the condition /health
+	// now reports rather than hides.
+	if w := do(t, h, "/sessions"); w.Code != http.StatusInternalServerError {
+		t.Errorf("/sessions on a pre-016 store: status = %d, want 500", w.Code)
 	}
 }

@@ -96,6 +96,14 @@ type SessionListItem struct {
 	CreatedAt   string       `json:"created_at"`
 	UpdatedAt   string       `json:"updated_at"`
 	Stats       SessionStats `json:"stats"`
+	// The session's two labels (opentalon-core migrations 014 / 016): who
+	// opened it. InteractionKind is "chat" or "system"; SystemSource names
+	// the feature behind a system session and is "" for a chat (NULL in the
+	// row). Both keys are always emitted, so a consumer can tell "no label"
+	// from a field it never received; both are opaque strings the plugin
+	// passes through unvalidated. Requires core migration 016 (see README).
+	InteractionKind string `json:"interaction_kind"`
+	SystemSource    string `json:"system_source"`
 }
 
 // SessionListResponse is the GET /sessions envelope. Totals are computed
@@ -133,9 +141,13 @@ type SessionDetail struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	CreatedAt   string            `json:"created_at"`
 	UpdatedAt   string            `json:"updated_at"`
-	Stats       SessionStats      `json:"stats"`
-	Messages    []Message         `json:"messages"`
-	Events      []Event           `json:"events"`
+	// Same two labels as SessionListItem, so a consumer that lands on one
+	// session directly can still tell a system run from a conversation.
+	InteractionKind string       `json:"interaction_kind"`
+	SystemSource    string       `json:"system_source"`
+	Stats           SessionStats `json:"stats"`
+	Messages        []Message    `json:"messages"`
+	Events          []Event      `json:"events"`
 }
 
 // Message is one row of the messages table — the user/assistant transcript.
@@ -702,7 +714,29 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "db unreachable")
 		return
 	}
+	// The list and detail queries select the two session-label columns
+	// unconditionally (opentalon-core migrations 014 / 016). A store that
+	// predates them would answer 500 on /sessions while this endpoint stayed
+	// green, so probe the columns here: a plugin build that reaches an older
+	// core reports itself unready instead of looking healthy.
+	if err := h.probeSessionLabelColumns(); err != nil {
+		log.Printf("api-plugin: /health: store schema behind core: %v", err)
+		writeErr(w, http.StatusServiceUnavailable,
+			"store schema behind core: sessions.interaction_kind / system_source missing (requires opentalon-core migration 016)")
+		return
+	}
 	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// probeSessionLabelColumns fails when the sessions table lacks the columns
+// migrations 014 / 016 add. LIMIT 0 keeps it a pure schema check on either
+// dialect.
+func (h *Handler) probeSessionLabelColumns() error {
+	rows, err := h.db.Query(`SELECT interaction_kind, system_source FROM sessions LIMIT 0`)
+	if err != nil {
+		return err
+	}
+	return rows.Close()
 }
 
 // sessionFilters captures the shared filter set across /sessions and
@@ -716,6 +750,8 @@ type sessionFilters struct {
 	Since            string   // RFC3339, empty = no lower bound
 	Until            string   // RFC3339, empty = no upper bound
 	TitleQuery       string   // case-insensitive substring match on title; empty = no title filter
+	Kind             string   // sessions.interaction_kind exact match; empty = no kind filter
+	SystemSource     string   // sessions.system_source exact match; empty = no source filter
 }
 
 func filtersFromQuery(r *http.Request) (sessionFilters, error) {
@@ -738,6 +774,11 @@ func filtersFromQuery(r *http.Request) (sessionFilters, error) {
 		ExcludeEntityIDs: excludeIDs,
 		Since:            since,
 		Until:            until,
+		// Opaque and unvalidated: both columns are extensible string enums in
+		// core, so an unknown value narrows to nothing rather than 400.
+		// Trimmed like `q`; empty means "no filter", never "match NULL".
+		Kind:         strings.TrimSpace(r.URL.Query().Get("kind")),
+		SystemSource: strings.TrimSpace(r.URL.Query().Get("system_source")),
 	}, nil
 }
 
@@ -1414,6 +1455,16 @@ func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
 	// `?entity_id=a&include_entity_ids=a,b` resolves to just `a`.
 	writeInClause(q, args, "s.entity_id", f.IncludeEntityIDs, false)
 	writeInClause(q, args, "s.entity_id", f.ExcludeEntityIDs, true)
+	// Exact matches on the sessions row, in the shared builder so a
+	// kind-scoped list and kind-scoped stats describe the same rows.
+	if f.Kind != "" {
+		q.WriteString(" AND s.interaction_kind = ?")
+		*args = append(*args, f.Kind)
+	}
+	if f.SystemSource != "" {
+		q.WriteString(" AND s.system_source = ?")
+		*args = append(*args, f.SystemSource)
+	}
 	if f.Since != "" {
 		q.WriteString(" AND se.ts >= ?")
 		*args = append(*args, f.Since)
@@ -1461,7 +1512,8 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 	var q strings.Builder
 	q.WriteString(`SELECT s.id, COALESCE(s.entity_id,''), COALESCE(s.group_id,''),
 		COALESCE(s.title,''), COALESCE(s.summary,''), COALESCE(s.active_model,''),
-		s.created_at, s.updated_at, `)
+		s.created_at, s.updated_at,
+		COALESCE(s.interaction_kind,''), COALESCE(s.system_source,''), `)
 	q.WriteString(sessionStatsSelect(d))
 	q.WriteString(` FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
 
@@ -1492,7 +1544,8 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 		}
 	}
 
-	q.WriteString(` GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model, s.created_at, s.updated_at`)
+	q.WriteString(` GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model,
+		s.created_at, s.updated_at, s.interaction_kind, s.system_source`)
 	if havingCursor {
 		q.WriteString(" HAVING ")
 		q.WriteString(keysetCmp(def.Expr, sort.Direction))
@@ -1523,7 +1576,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 	for rows.Next() {
 		var s SessionListItem
 		if err := rows.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Title, &s.Summary, &s.ActiveModel,
-			&s.CreatedAt, &s.UpdatedAt,
+			&s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource,
 			&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 			&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 			&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal); err != nil {
@@ -1578,15 +1631,17 @@ func getSession(db *sql.DB, d Dialect, id string, includeHidden bool) (*SessionD
 	var q strings.Builder
 	q.WriteString(`SELECT s.id, COALESCE(s.entity_id,''), COALESCE(s.group_id,''),
 		COALESCE(s.title,''), COALESCE(s.summary,''), COALESCE(s.active_model,''),
-		COALESCE(s.metadata,'{}'), s.created_at, s.updated_at, `)
+		COALESCE(s.metadata,'{}'), s.created_at, s.updated_at,
+		COALESCE(s.interaction_kind,''), COALESCE(s.system_source,''), `)
 	q.WriteString(sessionStatsSelect(d))
 	q.WriteString(` FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id
 		WHERE s.id = ?
-		GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model, s.metadata, s.created_at, s.updated_at`)
+		GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model, s.metadata,
+		s.created_at, s.updated_at, s.interaction_kind, s.system_source`)
 
 	row := db.QueryRow(d.Rebind(q.String()), id)
 	err := row.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Title, &s.Summary, &s.ActiveModel,
-		&metadataJSON, &s.CreatedAt, &s.UpdatedAt,
+		&metadataJSON, &s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource,
 		&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 		&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 		&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal)
@@ -1996,8 +2051,11 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 	// one of those lists (no entity_id / group_id / event_type) therefore
 	// loses the type-index fast path — callers in that shape should pair
 	// it with a tight since/until window.
+	// kind / system_source force the JOIN too: the no-JOIN path applies only
+	// since/until, so a filter missing here is dropped silently, not loudly.
 	needJoin := f.Filters.EntityID != "" || f.Filters.GroupID != "" ||
-		len(f.Filters.IncludeEntityIDs) > 0 || len(f.Filters.ExcludeEntityIDs) > 0
+		len(f.Filters.IncludeEntityIDs) > 0 || len(f.Filters.ExcludeEntityIDs) > 0 ||
+		f.Filters.Kind != "" || f.Filters.SystemSource != ""
 
 	var q strings.Builder
 	q.WriteString(`SELECT se.id, se.session_id, se.seq, se.ts, se.event_type,

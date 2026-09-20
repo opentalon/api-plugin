@@ -38,6 +38,42 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
   (e.g. support staff who shouldn't count against a tenant's cost view).
   Empty value and unknown ids are no-ops; capped at 200. ANDs with
   `include_entity_ids` if both are set.
+- `kind` — exact match on the session's `interaction_kind` (opentalon-core
+  migration 014): `chat` for a person's multi-turn conversation, `system`
+  for a single programmatic call the backend made on a user's behalf. Set
+  once at session creation; a resumed session keeps its kind. Use
+  `kind=chat` for a customer-facing session picker so in-app system runs
+  never surface as "conversations", `kind=system` to review them.
+- `system_source` — exact match on the session's `system_source`
+  (opentalon-core migration 016): the in-app feature that opened the
+  session, for attributing cost and debugging per feature instead of one
+  blurred `system` bucket. NULL in the row, and therefore `""` on the wire,
+  for every ordinary chat.
+
+  Both are **opaque, extensible string enums**: the plugin never validates
+  a value, so an unknown one matches no rows (empty list, `200`) rather
+  than `400`. Surrounding whitespace is trimmed; case matters. An **empty
+  value is a no-op**, the same as leaving the parameter out — so
+  `system_source=` does not select the unlabelled rows; use `kind=chat`
+  for those. `system_source` sits on the session (which feature opened the
+  conversation); the per-turn label lives on `profile_usage.system_source`,
+  which this API does not expose — a backend job that injects a turn into a
+  person's chat session labels that turn, not the session.
+
+  **Requires opentalon-core with migration 016 applied.** The list and
+  detail queries select both columns unconditionally, so against an older
+  core every `/sessions` and `/sessions/{id}` call answers `500`;
+  `/events` and `/events/stats` fail only when `system_source` is set
+  (`kind` reads the older column from migration 014 and keeps working, so
+  it is not a compatibility probe). `/health` checks for both columns and
+  answers `503` with the reason when the store is behind, so a plugin build
+  that reaches an older core reports itself unready. Core applies its
+  migrations at startup before it loads plugins, so a core-then-plugin
+  rollout is safe. During a mixed rollout (pods on the old and the new
+  build side by side) an old pod ignores both filters: a paged `kind=chat`
+  listing whose next page lands on an old pod comes back unfiltered, so
+  consumers that must never show a system session should start relying on
+  the filters once every pod runs this build.
 - `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive. **Filter on event timestamp uniformly across all endpoints**: a session with `created_at` before the window but events inside is included; a session with `created_at` inside the window but events outside is not. Containers vs activity — the API tracks activity.
 - `limit` — page size, default 25, capped at 200. Any value outside `(1..200]` → 400 (matches the strictness of every other cap in the API). To page through more rows, use the returned `next_cursor`.
 - `q` (**`/sessions` only**) — case-insensitive substring match on the session `title`. Sessions with no title yet never match. LIKE metacharacters (`%`, `_`) in the term match literally. Trimmed, capped at 200 chars. Composes with the cursor for paged search.
@@ -115,7 +151,9 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
         "tokens_out_total": 1024,
         "cost_input_total": 0.0123,
         "cost_output_total": 0.045
-      }
+      },
+      "interaction_kind": "chat",   // always present: "chat" | "system" | a future core label
+      "system_source": ""           // always present; "" on every ordinary chat, e.g. "csv_mapping" on a system session
     }
   ],
   "totals": { "session_count": 142, "llm_call_count": 631, "tokens_in_total": ..., ... },
@@ -124,6 +162,8 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
 ```
 
 `/events/stats` returns just the totals block by default.
+
+`GET /sessions/{id}` carries the same `interaction_kind` / `system_source` pair at the top level of its envelope.
 
 #### Assistant `tool_calls` on `/sessions/{id}`
 
