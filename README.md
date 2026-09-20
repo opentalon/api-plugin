@@ -62,11 +62,18 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 
   **Requires opentalon-core with migration 016 applied.** The list and
   detail queries select both columns unconditionally, so against an older
-  core every `/sessions` and `/sessions/{id}` call answers `500`, and
-  `/events` or `/events/stats` do the same as soon as either filter is set
-  (`/health` stays green). Core applies its migrations at startup before it
-  loads plugins, so a core-then-plugin rollout is safe; a plugin build
-  tracking `master` must not reach a core that predates 016.
+  core every `/sessions` and `/sessions/{id}` call answers `500`;
+  `/events` and `/events/stats` fail only when `system_source` is set
+  (`kind` reads the older column from migration 014 and keeps working, so
+  it is not a compatibility probe). `/health` checks for both columns and
+  answers `503` with the reason when the store is behind, so a plugin build
+  that reaches an older core reports itself unready. Core applies its
+  migrations at startup before it loads plugins, so a core-then-plugin
+  rollout is safe. During a mixed rollout (pods on the old and the new
+  build side by side) an old pod ignores both filters: a paged `kind=chat`
+  listing whose next page lands on an old pod comes back unfiltered, so
+  consumers that must never show a system session should start relying on
+  the filters once every pod runs this build.
 - `since`, `until` — RFC3339 timestamps; left-inclusive, right-exclusive. **Filter on event timestamp uniformly across all endpoints**: a session with `created_at` before the window but events inside is included; a session with `created_at` inside the window but events outside is not. Containers vs activity — the API tracks activity.
 - `limit` — page size, default 25, capped at 200. Any value outside `(1..200]` → 400 (matches the strictness of every other cap in the API). To page through more rows, use the returned `next_cursor`.
 - `q` (**`/sessions` only**) — case-insensitive substring match on the session `title`. Sessions with no title yet never match. LIKE metacharacters (`%`, `_`) in the term match literally. Trimmed, capped at 200 chars. Composes with the cursor for paged search.

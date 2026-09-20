@@ -714,7 +714,29 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "db unreachable")
 		return
 	}
+	// The list and detail queries select the two session-label columns
+	// unconditionally (opentalon-core migrations 014 / 016). A store that
+	// predates them would answer 500 on /sessions while this endpoint stayed
+	// green, so probe the columns here: a plugin build that reaches an older
+	// core reports itself unready instead of looking healthy.
+	if err := h.probeSessionLabelColumns(); err != nil {
+		log.Printf("api-plugin: /health: store schema behind core: %v", err)
+		writeErr(w, http.StatusServiceUnavailable,
+			"store schema behind core: sessions.interaction_kind / system_source missing (requires opentalon-core migration 016)")
+		return
+	}
 	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// probeSessionLabelColumns fails when the sessions table lacks the columns
+// migrations 014 / 016 add. LIMIT 0 keeps it a pure schema check on either
+// dialect.
+func (h *Handler) probeSessionLabelColumns() error {
+	rows, err := h.db.Query(`SELECT interaction_kind, system_source FROM sessions LIMIT 0`)
+	if err != nil {
+		return err
+	}
+	return rows.Close()
 }
 
 // sessionFilters captures the shared filter set across /sessions and

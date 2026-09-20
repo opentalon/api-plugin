@@ -3864,3 +3864,27 @@ func TestGetSession_ReturnsKindAndSystemSource(t *testing.T) {
 		}
 	}
 }
+
+// A store that predates core migration 016 makes every /sessions call fail
+// with a generic 500. /health must not stay green over that: it probes the
+// two label columns and reports the store as behind, with the reason.
+func TestHealth_StoreBehindCoreMigration(t *testing.T) {
+	h := newTestHandler(t)
+	if _, err := h.db.Exec(`ALTER TABLE sessions DROP COLUMN system_source`); err != nil {
+		t.Fatalf("drop column to simulate a pre-016 store: %v", err)
+	}
+
+	w := do(t, h, "/health")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "migration 016") {
+		t.Errorf("body should name the missing migration, got %s", w.Body.String())
+	}
+
+	// The list endpoint really is down on that store — the condition /health
+	// now reports rather than hides.
+	if w := do(t, h, "/sessions"); w.Code != http.StatusInternalServerError {
+		t.Errorf("/sessions on a pre-016 store: status = %d, want 500", w.Code)
+	}
+}
