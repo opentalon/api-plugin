@@ -152,27 +152,25 @@ type SessionDetail struct {
 
 // Message is one row of the messages table — the user/assistant transcript.
 //
-// ToolCalls is a passthrough of the matching llm_response event's
-// payload.native_tool_calls_raw — the raw provider-shaped tool-call
-// array (id, type, function.name, function.arguments). It is populated
-// only on assistant rows that actually invoked tools and is omitted
-// otherwise, so user/tool rows (and assistant rows that emitted only
-// text) stay byte-identical to the pre-passthrough contract.
+// ToolCalls holds the tool calls this assistant row invoked, in the
+// provider's own raw shape (for OpenAI-style providers id, type,
+// function.name, function.arguments; for Anthropic, tool_use blocks with
+// id, name, input), lifted verbatim from payload.native_tool_calls_raw of
+// the llm_response event that emitted them. It is populated only on assistant rows that actually
+// invoked tools and is omitted otherwise, so user/tool rows (and assistant
+// rows that emitted only text) stay byte-identical to the pre-passthrough
+// contract.
 //
-// The messages table does have a tool_calls column (opentalon-core
-// migration 008, alongside tool_call_id) and Core writes it, but it holds
-// Core's own normalized shape — {id, name, arguments} — not the provider
-// wire shape this field promises. We therefore serve the raw array from
-// session_events.payload instead, pairing the n-th assistant message with
-// the n-th llm_response event in chronological order per the
-// orchestrator's 1:1 contract. See annotateAssistantToolCalls.
-//
-// Note that this ordinal pairing is a positional assumption, unlike
-// ToolCallID below, which joins on a real key. A session whose assistant
-// message count and main-loop llm_response count diverge — a retried
-// round writes a second response with no message — silently shifts every
-// later row, and the field goes missing rather than wrong. Anything that
-// must be exact should use ToolCallID.
+// Row and event are joined on the tool-call id. The messages table has a
+// tool_calls column (opentalon-core migration 008, alongside tool_call_id)
+// that Core writes on every native dispatch row, but in its own normalized
+// shape — {id, name, arguments} — not the provider wire shape this field
+// promises. The stored value is therefore read only for its ids, and the
+// native_tool_calls_raw entries those ids name are what is served, so a
+// call Core repaired before running it (the tool-call repair corrector
+// keeps its id) shows the arguments the model sent, not the corrected ones
+// Core stored. A row whose calls cannot be told apart this way gets no
+// field; see annotateAssistantToolCalls.
 //
 // Metadata is the per-message metadata column (opentalon-core migration 013):
 // a small JSON map of UI markers (e.g. a tool-confirmation prompt's
@@ -209,6 +207,11 @@ type Message struct {
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Metadata   json.RawMessage `json:"metadata,omitempty"`
 	CreatedAt  string          `json:"created_at"`
+
+	// callIDs are the ids in the stored messages.tool_calls column — Core's
+	// own record of the calls this row invoked. They are the join key
+	// annotateAssistantToolCalls uses and are never serialized.
+	callIDs []string
 }
 
 // Event is one row of session_events. Payload is inlined as a raw JSON
@@ -1671,35 +1674,129 @@ func getSession(db *sql.DB, d Dialect, id string, includeHidden bool) (*SessionD
 	return &s, nil
 }
 
-// annotateAssistantToolCalls copies payload.native_tool_calls_raw from
-// each llm_response event onto the corresponding assistant message in
-// chronological order. The orchestrator emits exactly one MAIN-LOOP
-// llm_response event per assistant message row, in matching order —
-// that's the pairing contract, by ordinal rather than by seq (the
-// messages table and session_events table maintain independent seq
-// sequences).
+// annotateAssistantToolCalls attaches to each assistant row the tool calls
+// it invoked, in the provider's wire shape, taken from the session's
+// llm_response events.
 //
-// Side-calls (confirmation classifier, session-title generation, the
-// tool-call repair corrector, session summarization) also emit
-// llm_response events into the same stream but produce NO assistant
-// message row; counting them would shift the pairing for every later
-// assistant message in the session. They are recognizable by
-// parentage: the orchestrator nests each side-call's
-// llm_request/llm_response under a sentinel event — usually named
-// `*_invoked` (confirmation_classification_invoked,
-// session_title_invoked, tool_call_repair_invoked, …), with one
-// naming exception: session summarization parents its side-call under
-// `summarization_triggered`. Main-loop responses are never parented
-// on a sentinel — so llm_response events whose parent is a sentinel
-// are skipped here.
+// Rows and events are joined on the tool-call id, rather than by seq (the
+// messages and session_events tables keep independent seq sequences) or by
+// position. Position is not a reliable key, and a write confirmation shows
+// why. The response that proposes the call is followed by the confirmation
+// question row, which runs nothing; the call runs, and its row is written,
+// only on the next turn once the user approves — a turn with no main-loop
+// response of its own for that row. Counting rows against responses put
+// the call on the question and left the row that ran it empty.
 //
-// Empty arrays and explicit nulls are omitted: the field exists on
-// Message only when the assistant actually invoked tools, so user/tool
-// rows and text-only assistant rows stay byte-identical to the
-// pre-passthrough contract. If the event payload is malformed or has
-// no key, the message simply gets no tool_calls field — the failure
-// mode is "missing optional metadata", not "endpoint 500s".
+// A row is served when each id it stores is carried by exactly one entry
+// and by no other assistant row. It then gets the event's array unchanged
+// when it holds every call of that response (the usual single-call round),
+// and only its own entries when Core wrote a multi-call response as one row
+// per call. Every other row gets no tool_calls field — the failure mode is
+// "missing optional metadata", never "endpoint 500s":
+//
+//   - a row that stores no call id: Core stores the ids on every row that
+//     runs a native call, so such a row ran none;
+//   - a row storing an id Core made up for the call itself (see
+//     madeUpByCore), as it does when the provider sent the call without an
+//     id: such an id names no provider entry, not even one that happens to
+//     carry the same string;
+//   - a row whose id several entries carry, from a provider that reuses ids
+//     across responses: which row ran which entry cannot be told from their
+//     order, since a call that waits for a confirmation gets its row only
+//     when it is approved, after calls proposed later may have got theirs;
+//   - a row whose ids do not all resolve: it gets nothing, not a partial
+//     list.
+//
+// For the rest, ids a provider sends and never reuses, the entry carrying a
+// row's id is that row's call, so no row gets another row's calls. For a provider that
+// reuses ids, the one-entry check sees only the events already stored, and
+// Core writes events through a buffer that can lag behind the rows or drop
+// events when full: the single entry in view can then belong to a call that
+// got no row (a rejected write) while the row's own entry is missing.
+//
+// Side-call llm_response events are skipped. Side-calls (confirmation
+// classifier, session-title generation, the tool-call repair corrector,
+// session summarization) emit llm_response events into the same stream
+// but belong to no assistant row, and one that restates a main-loop call
+// id (the repair corrector restating the call it fixes) would make that id
+// look reused. They are recognizable by parentage: the orchestrator nests
+// each side-call's llm_request/llm_response under a sentinel event —
+// usually named `*_invoked` (confirmation_classification_invoked,
+// session_title_invoked, tool_call_repair_invoked, …), with one naming
+// exception: session summarization parents its side-call under
+// `summarization_triggered`. Main-loop responses are never parented on a
+// sentinel. Other llm_response events that pass this filter without tool
+// calls, such as the wording of a confirmation question, add no entries.
+//
+// Empty arrays and explicit nulls are omitted, as are malformed payloads:
+// the field exists on Message only when the assistant actually invoked
+// tools, so user/tool rows and text-only assistant rows stay
+// byte-identical to the pre-passthrough contract.
 func annotateAssistantToolCalls(msgs []Message, evts []Event) {
+	responses := mainLoopToolCalls(evts)
+	entries := make(map[string][]rawEntryRef) // per id, in event order
+	for ri, r := range responses {
+		for ei, id := range r.ids {
+			if id != "" {
+				entries[id] = append(entries[id], rawEntryRef{resp: ri, idx: ei})
+			}
+		}
+	}
+	rows := make(map[string]int) // per id, how many assistant rows store it
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			for _, id := range m.callIDs {
+				rows[id]++
+			}
+		}
+	}
+	for mi := range msgs {
+		m := &msgs[mi]
+		if m.Role != "assistant" || len(m.callIDs) == 0 {
+			continue
+		}
+		refs := make([]rawEntryRef, 0, len(m.callIDs))
+		for _, id := range m.callIDs {
+			if es := entries[id]; len(es) == 1 && rows[id] == 1 && !madeUpByCore(id) {
+				refs = append(refs, es[0])
+			}
+		}
+		if len(refs) == len(m.callIDs) {
+			m.ToolCalls = toolCallsFor(responses, refs)
+		}
+	}
+}
+
+// madeUpByCore reports whether id has the form of an id Core makes up for a
+// call itself: "call-<n>" for a call the provider sent without an id or
+// that Core parsed from text, "planner-<plugin>-<action>" and
+// "pipeline-<plugin>-<action>" for calls its planner runs.
+func madeUpByCore(id string) bool {
+	if strings.HasPrefix(id, "planner-") || strings.HasPrefix(id, "pipeline-") {
+		return true
+	}
+	n, ok := strings.CutPrefix(id, "call-")
+	return ok && n != "" && strings.Trim(n, "0123456789") == ""
+}
+
+// mainLoopResponse is the tool-call half of one main-loop llm_response.
+// raw is its payload.native_tool_calls_raw exactly as stored — nil when the
+// round called no tools (key absent, null or []) or the payload does not
+// parse. entries is the same array split into its elements, nil when raw
+// is not an array, and ids[i] is the id entries[i] carries ("" for none).
+type mainLoopResponse struct {
+	raw     json.RawMessage
+	entries []json.RawMessage
+	ids     []string
+}
+
+// rawEntryRef points at one entry of one main-loop response.
+type rawEntryRef struct{ resp, idx int }
+
+// mainLoopToolCalls returns one mainLoopResponse per main-loop llm_response
+// event, in event order, skipping side-calls (see
+// annotateAssistantToolCalls).
+func mainLoopToolCalls(evts []Event) []mainLoopResponse {
 	// Ids of side-call sentinel events (`*_invoked`, plus the
 	// `summarization_triggered` naming exception); an llm_response
 	// parented on one belongs to a side-call, not to an assistant
@@ -1710,30 +1807,94 @@ func annotateAssistantToolCalls(msgs []Message, evts []Event) {
 			sentinels[e.ID] = true
 		}
 	}
-	ei := 0
-	for mi := range msgs {
-		if msgs[mi].Role != "assistant" {
+	var out []mainLoopResponse
+	for _, e := range evts {
+		if e.EventType != eventTypeLLMResponse || (e.ParentID != "" && sentinels[e.ParentID]) {
 			continue
 		}
-		for ei < len(evts) &&
-			(evts[ei].EventType != eventTypeLLMResponse ||
-				(evts[ei].ParentID != "" && sentinels[evts[ei].ParentID])) {
-			ei++
-		}
-		if ei >= len(evts) {
-			return
-		}
+		var r mainLoopResponse
 		var p struct {
 			NativeToolCallsRaw json.RawMessage `json:"native_tool_calls_raw"`
 		}
-		if err := json.Unmarshal(evts[ei].Payload, &p); err == nil && len(p.NativeToolCallsRaw) > 0 {
+		if err := json.Unmarshal(e.Payload, &p); err == nil && len(p.NativeToolCallsRaw) > 0 {
 			tc := bytes.TrimSpace(p.NativeToolCallsRaw)
 			if !bytes.Equal(tc, []byte("null")) && !bytes.Equal(tc, []byte("[]")) {
-				msgs[mi].ToolCalls = p.NativeToolCallsRaw
+				r.raw = p.NativeToolCallsRaw
+				// A value that is not an array leaves entries nil: there
+				// is nothing to join on, and no row gets it.
+				if err := json.Unmarshal(tc, &r.entries); err != nil {
+					r.entries = nil
+				}
+				r.ids = make([]string, len(r.entries))
+				for i, raw := range r.entries {
+					var c struct {
+						ID string `json:"id"`
+					}
+					if json.Unmarshal(raw, &c) == nil {
+						r.ids[i] = c.ID
+					}
+				}
 			}
 		}
-		ei++
+		out = append(out, r)
 	}
+	return out
+}
+
+// toolCallsFor returns the raw entries refs point at as one JSON array,
+// each entry byte for byte as stored. When they are the whole array of a
+// single response, in order — the usual single-call round — the event's
+// array itself is returned, unchanged.
+func toolCallsFor(responses []mainLoopResponse, refs []rawEntryRef) json.RawMessage {
+	first := responses[refs[0].resp]
+	whole := len(refs) == len(first.entries)
+	for i, ref := range refs {
+		if ref.resp != refs[0].resp || ref.idx != i {
+			whole = false
+			break
+		}
+	}
+	if whole {
+		return first.raw
+	}
+	var b bytes.Buffer
+	b.WriteByte('[')
+	for i, ref := range refs {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(responses[ref.resp].entries[ref.idx])
+	}
+	b.WriteByte(']')
+	return b.Bytes()
+}
+
+// storedCallIDs returns the call ids in a stored messages.tool_calls value,
+// Core's JSON array of {id, name, arguments}. NULL, empty and malformed
+// values yield nil, and so does a list with any id-less entry, which could
+// only be joined in part: the row then has nothing to join on.
+func storedCallIDs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var calls []struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal([]byte(raw), &calls) != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(calls))
+	for _, c := range calls {
+		if c.ID == "" {
+			return nil
+		}
+		ids = append(ids, c.ID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return ids
 }
 
 // mergeErrorMessages inserts a synthetic `role:"error"` Message for each
@@ -1862,7 +2023,11 @@ func sessionMessages(db *sql.DB, d Dialect, id string, includeHidden bool) ([]Me
 	// include_hidden=true to debug them; the customer chat widget does not.
 	// COALESCE(tool_call_id,'') for the same reason: the column is nullable
 	// and NULL on every row that is not a native-path tool result.
-	q := `SELECT seq, role, content, COALESCE(metadata,''), COALESCE(tool_call_id,''), created_at FROM messages WHERE session_id = ?`
+	// COALESCE(tool_calls,'') likewise, NULL on every row that is not a
+	// native-path dispatch; it is read only for its call ids (the join key of
+	// annotateAssistantToolCalls) and never served as-is. The column dates
+	// from migration 008, older than any column this reader already needs.
+	q := `SELECT seq, role, content, COALESCE(metadata,''), COALESCE(tool_call_id,''), COALESCE(tool_calls,''), created_at FROM messages WHERE session_id = ?`
 	if !includeHidden {
 		q += ` AND (visibility IS NULL OR visibility <> 'hidden')`
 	}
@@ -1876,10 +2041,11 @@ func sessionMessages(db *sql.DB, d Dialect, id string, includeHidden bool) ([]Me
 	msgs := []Message{}
 	for rows.Next() {
 		var m Message
-		var metadata string
-		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &metadata, &m.ToolCallID, &m.CreatedAt); err != nil {
+		var metadata, toolCalls string
+		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &metadata, &m.ToolCallID, &toolCalls, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("sessionMessages scan: %w", err)
 		}
+		m.callIDs = storedCallIDs(toolCalls)
 		// Inline the raw JSON only when present and non-empty — mirror the
 		// null/[] guard annotateAssistantToolCalls applies to tool_calls, and
 		// keep omitempty rows byte-identical to the pre-013 contract. A

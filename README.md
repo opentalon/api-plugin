@@ -167,9 +167,20 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
 
 #### Assistant `tool_calls` on `/sessions/{id}`
 
-Each assistant row in `messages[]` carries an optional `tool_calls` field — the raw provider-shaped tool-call array (`id`, `type`, `function.name`, `function.arguments`) lifted verbatim from the matching `llm_response` event's `payload.native_tool_calls_raw`. The field is omitted on rows that did not invoke tools, so user/tool rows and text-only assistant rows stay byte-identical to the pre-passthrough shape.
+Each assistant row in `messages[]` carries an optional `tool_calls` field — the tool calls that row invoked, in the provider's own raw shape (for OpenAI-style providers `id`, `type`, `function.name`, `function.arguments`; for Anthropic, `tool_use` blocks with `id`, `name`, `input`), lifted verbatim from `payload.native_tool_calls_raw` of the `llm_response` event that emitted them. The field is omitted on rows that did not invoke tools, so user/tool rows and text-only assistant rows stay byte-identical to the pre-passthrough shape.
 
-Pairing is by ordinal: the n-th assistant message receives the n-th `llm_response` event's tool calls (the orchestrator's 1:1 chronological contract). Tool-calling assistant turns therefore render as a single message row with `content` (may be empty) plus `tool_calls`, rather than forcing the consumer to stitch the call back out of the event stream.
+Rows and events are joined on the tool-call id: Core stores the ids of the calls a row invoked in `messages.tool_calls` (migration 008), and when the provider sends call ids, the `native_tool_calls_raw` entry of each call carries the same id (for a call sent without one, Core makes the id up; see below). A row holding every call of its response gets the event's array unchanged; when Core wrote a multi-call response as one row per call, each row gets only its own entries. The entries are served as the model sent them: for a call Core repaired before running it, the corrected arguments are in Core's stored call, not in this field. This keeps the calls on the right row where rows and responses do not line up one to one — most visibly around a write confirmation, where the call is proposed on one turn, the next row is the confirmation question, and the call runs (and its row is written) on the turn after the user approves. It also holds for retried rounds and for sessions whose oldest rows were trimmed or summarized away.
+
+A row that cannot be placed gets no `tool_calls` field, never a guess:
+
+- a row that stores no call id — Core stores the ids on every row that runs a native call, so such a row ran none;
+- a row storing an id Core made up for the call itself — `call-1`, `call-2`, … when the provider sent the call without an id or Core parsed it from text, `planner-<plugin>-<action>` or `pipeline-<plugin>-<action>` for a call its planner ran; such an id names no provider entry, not even one that happens to carry the same string, so rows from a provider that sends no call ids get no field;
+- a row whose id several entries or several rows carry, as with a provider that reuses ids across responses — a call that waits for a confirmation gets its row only when it is approved, after calls proposed later may have got theirs, so the order does not tell which is which;
+- a row whose ids do not all resolve.
+
+For the rest, ids a provider sends and never reuses, the entry carrying a row's id is that row's call, so no row gets another row's calls. For a provider that reuses ids, the check sees only the events already stored, and Core writes events through a buffer that can lag behind the rows or drop events when full; the single entry in view can then belong to a call that got no row (a rejected write) while the row's own entry is missing.
+
+Tool-calling assistant turns therefore render as a message row with `content` (may be empty) plus `tool_calls`, rather than forcing the consumer to stitch the call back out of the event stream.
 
 ```jsonc
 // GET /sessions/{id} — assistant turn that emitted tool calls only
