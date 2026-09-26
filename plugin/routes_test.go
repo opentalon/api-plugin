@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -45,7 +46,7 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			interaction_kind TEXT NOT NULL DEFAULT 'chat',
 			system_source TEXT
 		)`,
-		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, tool_call_id TEXT, metadata TEXT, visibility TEXT, created_at TEXT)`,
+		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, tool_calls TEXT, tool_call_id TEXT, metadata TEXT, visibility TEXT, created_at TEXT)`,
 		`CREATE UNIQUE INDEX idx_messages_session_seq ON messages(session_id, seq)`,
 		`CREATE TABLE session_events (
 			id TEXT PRIMARY KEY,
@@ -1014,10 +1015,10 @@ func TestGetSession_NotFound(t *testing.T) {
 // assistant turns as `content:""` with no tool_calls field, forcing the
 // chat-bubble consumer to reconstruct the call from the events stream.
 //
-// Pairing contract under test: n-th assistant message ↔ n-th
-// llm_response event, by ordinal. Non-assistant rows (user, tool) and
-// text-only assistant rows must not gain a tool_calls field — the
-// passthrough is strictly additive.
+// Pairing contract under test: the assistant row gets the llm_response
+// entries named by the call ids Core stored on it (messages.tool_calls).
+// Non-assistant rows (user, tool) and text-only assistant rows must not
+// gain a tool_calls field — the passthrough is strictly additive.
 func TestGetSession_ToolCallsPassthrough(t *testing.T) {
 	h := newTestHandler(t)
 	exec := func(q string, args ...any) {
@@ -1031,11 +1032,11 @@ func TestGetSession_ToolCallsPassthrough(t *testing.T) {
 
 	// user → assistant tool-call-only → tool → assistant text answer.
 	// The first assistant row has empty content (the LLM only emitted
-	// tool_calls); the second carries the final text. Both should pair
-	// with the two llm_response events in order.
+	// tool_calls, which Core stores in its own shape); the second carries
+	// the final text.
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',1,'user','show me items','2024-03-01T10:00:00Z')`)
-	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',2,'assistant','','2024-03-01T10:00:01Z')`)
-	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',3,'tool','{"items":[]}','2024-03-01T10:00:02Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, tool_calls, created_at) VALUES ('sess_tc',2,'assistant','','[{"id":"call_1","name":"list-items","arguments":{}}]','2024-03-01T10:00:01Z')`)
+	exec(`INSERT INTO messages (session_id, seq, role, content, tool_call_id, created_at) VALUES ('sess_tc',3,'tool','{"items":[]}','call_1','2024-03-01T10:00:02Z')`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',4,'assistant','No items found.','2024-03-01T10:00:03Z')`)
 
 	toolCallsPayload := `{"v":1,"raw_content_excerpt":"","tokens_in":50,"tokens_out":20,"cost_input":0,"cost_output":0,"native_tool_calls_raw":[{"id":"call_1","type":"function","function":{"name":"list-items","arguments":"{}"}}],"finish_reason":"tool_calls"}`
@@ -3275,17 +3276,17 @@ func TestSessionDebugEvents_LimitValidation(t *testing.T) {
 	}
 }
 
-// annotateAssistantToolCalls pairs the n-th assistant message with the n-th
-// MAIN-LOOP llm_response. Side-call llm_responses (confirmation classifier,
-// title generation, tool-call repair corrector) are parented under an
-// *_invoked sentinel event and have no assistant message row — they must be
-// skipped, or every assistant message after the first side-call pairs with
-// the wrong llm_response and its tool-call annotation shifts or disappears.
+// Side-call llm_responses (confirmation classifier, title generation,
+// tool-call repair corrector) are parented under an *_invoked sentinel event
+// and belong to no assistant row — they must be skipped. A side-call that
+// restates a main-loop call id (here the repair corrector restating the call
+// it fixes) would otherwise make that id ambiguous and cost the row its
+// calls.
 func TestAnnotateAssistantToolCalls_SkipsSideCallLLMResponses(t *testing.T) {
 	msgs := []Message{
 		{Seq: 1, Role: "user", Content: "set the responsible user"},
-		{Seq: 2, Role: "assistant", Content: "calling the tool"},
-		{Seq: 3, Role: "tool", Content: "ok"},
+		{Seq: 2, Role: "assistant", Content: "calling the tool", callIDs: []string{"tc-1"}},
+		{Seq: 3, Role: "tool", Content: "ok", ToolCallID: "tc-1"},
 		{Seq: 4, Role: "assistant", Content: "done"},
 	}
 	evts := []Event{
@@ -3297,7 +3298,7 @@ func TestAnnotateAssistantToolCalls_SkipsSideCallLLMResponses(t *testing.T) {
 		{ID: "e2", EventType: "tool_call_repair_invoked"},
 		{ID: "e3", ParentID: "e2", EventType: "llm_request"},
 		{ID: "e4", ParentID: "e2", EventType: "llm_response",
-			Payload: json.RawMessage(`{"native_tool_calls_raw":null}`)},
+			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-1","note":"corrected"}]}`)},
 		// Main-loop response #2: the final answer for assistant msg 4.
 		{ID: "e5", EventType: "llm_response",
 			Payload: json.RawMessage(`{"native_tool_calls_raw":null}`)},
@@ -3307,8 +3308,6 @@ func TestAnnotateAssistantToolCalls_SkipsSideCallLLMResponses(t *testing.T) {
 	if string(msgs[1].ToolCalls) != `[{"id":"tc-1"}]` {
 		t.Fatalf("assistant msg 2 tool_calls = %q, want the main-loop annotation", msgs[1].ToolCalls)
 	}
-	// Without the sentinel skip, msg 4 would pair with the corrector's e4;
-	// with it, msg 4 pairs with e5 (null → no tool_calls field).
 	if msgs[3].ToolCalls != nil {
 		t.Fatalf("assistant msg 4 tool_calls = %q, want none (final answer)", msgs[3].ToolCalls)
 	}
@@ -3317,15 +3316,13 @@ func TestAnnotateAssistantToolCalls_SkipsSideCallLLMResponses(t *testing.T) {
 // Session summarization is the one side-call whose sentinel event is NOT
 // named `*_invoked`: the orchestrator parents the summarizer's
 // llm_request/llm_response under a `summarization_triggered` event and
-// writes no assistant message row. Its llm_response must be skipped too,
-// or every assistant message after a summarization pairs with the wrong
-// llm_response.
+// writes no assistant message row. Its llm_response must be skipped too.
 func TestAnnotateAssistantToolCalls_SkipsSummarizationLLMResponses(t *testing.T) {
 	msgs := []Message{
 		{Seq: 1, Role: "user", Content: "set the responsible user"},
-		{Seq: 2, Role: "assistant", Content: "calling the tool"},
-		{Seq: 3, Role: "tool", Content: "ok"},
-		{Seq: 4, Role: "assistant", Content: "done"},
+		{Seq: 2, Role: "assistant", Content: "calling the tool", callIDs: []string{"tc-1"}},
+		{Seq: 3, Role: "tool", Content: "ok", ToolCallID: "tc-1"},
+		{Seq: 4, Role: "assistant", Content: "calling it again", callIDs: []string{"tc-2"}},
 	}
 	evts := []Event{
 		// Main-loop response #1: carries the tool call for assistant msg 2.
@@ -3333,14 +3330,12 @@ func TestAnnotateAssistantToolCalls_SkipsSummarizationLLMResponses(t *testing.T)
 			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-1"}]}`)},
 		// Session summarization side-call: `summarization_triggered`
 		// sentinel + nested llm_request/llm_response. No assistant
-		// message row exists for it. The noise payload makes a
-		// mispairing observable (same trick as classifier-noise in
-		// the ordinal-stability test below) — with null payloads on
-		// both candidates the assertion could not tell e4 from e5.
+		// message row exists for it. Its payload restates tc-2, so a
+		// missing skip would make that id ambiguous.
 		{ID: "e2", EventType: "summarization_triggered"},
 		{ID: "e3", ParentID: "e2", EventType: "llm_request"},
 		{ID: "e4", ParentID: "e2", EventType: "llm_response",
-			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"summarizer-noise"}]}`)},
+			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-2","note":"summarizer"}]}`)},
 		// Main-loop response #2: the annotation assistant msg 4 must
 		// receive.
 		{ID: "e5", EventType: "llm_response",
@@ -3351,37 +3346,640 @@ func TestAnnotateAssistantToolCalls_SkipsSummarizationLLMResponses(t *testing.T)
 	if string(msgs[1].ToolCalls) != `[{"id":"tc-1"}]` {
 		t.Fatalf("assistant msg 2 tool_calls = %q, want the main-loop annotation", msgs[1].ToolCalls)
 	}
-	// Without the summarization sentinel, msg 4 pairs with the
-	// summarizer's e4 and carries summarizer-noise instead.
 	if string(msgs[3].ToolCalls) != `[{"id":"tc-2"}]` {
 		t.Fatalf("assistant msg 4 tool_calls = %q, want tc-2 (not the summarizer's)", msgs[3].ToolCalls)
 	}
 }
 
-// Regression guard for the ordinal shift itself: with a side-call response
-// interleaved, the SECOND assistant message must still receive the SECOND
-// main-loop response's annotation.
-func TestAnnotateAssistantToolCalls_OrdinalStableAcrossSideCalls(t *testing.T) {
+// Rows that store no call id get no calls, even when the responses carry
+// some. Core stores the ids on every row that runs a native call, so these
+// rows ran none; counting rows against responses, as this endpoint once did,
+// would hand them other rows' calls.
+func TestAnnotateAssistantToolCalls_RowsWithoutStoredCallIDsGetNone(t *testing.T) {
 	msgs := []Message{
-		{Seq: 1, Role: "assistant", Content: "first tool round"},
-		{Seq: 2, Role: "assistant", Content: "second tool round"},
+		{Seq: 1, Role: "assistant", Content: "first answer"},
+		{Seq: 2, Role: "assistant", Content: "second answer"},
 	}
 	evts := []Event{
 		{ID: "e1", EventType: "llm_response",
 			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-1"}]}`)},
-		{ID: "e2", EventType: "confirmation_classification_invoked"},
-		{ID: "e3", ParentID: "e2", EventType: "llm_response",
-			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"classifier-noise"}]}`)},
-		{ID: "e4", EventType: "llm_response",
-			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-2"}]}`)},
+		{ID: "e2", EventType: "llm_response",
+			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"type":"function"}]}`)},
 	}
 	annotateAssistantToolCalls(msgs, evts)
 
-	if string(msgs[0].ToolCalls) != `[{"id":"tc-1"}]` {
-		t.Fatalf("assistant msg 1 tool_calls = %q, want tc-1", msgs[0].ToolCalls)
+	for _, m := range msgs {
+		if m.ToolCalls != nil {
+			t.Errorf("seq %d tool_calls = %s, want none", m.Seq, m.ToolCalls)
+		}
 	}
-	if string(msgs[1].ToolCalls) != `[{"id":"tc-2"}]` {
-		t.Fatalf("assistant msg 2 tool_calls = %q, want tc-2 (not the side-call's)", msgs[1].ToolCalls)
+}
+
+// storedCallIDs reads only the ids of Core's stored tool_calls value, and
+// gives up on anything it could join only in part.
+func TestStoredCallIDs(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"  ", nil},
+		{"null", nil},
+		{"[]", nil},
+		{"not json", nil},
+		{`{"id":"a"}`, nil},
+		{`[{"id":"a","name":"p__x","arguments":{}}]`, []string{"a"}},
+		{`[{"id":"a"},{"id":"b"}]`, []string{"a", "b"}},
+		{`[{"id":"a"},{"name":"p__x"}]`, nil},
+	} {
+		if got := storedCallIDs(tc.in); !slices.Equal(got, tc.want) {
+			t.Errorf("storedCallIDs(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A row holding several calls is served only when every one of them pairs;
+// here the events carry its second call only.
+func TestAnnotateAssistantToolCalls_RowNeedsEveryCall(t *testing.T) {
+	msgs := []Message{
+		{Seq: 1, Role: "user"},
+		{Seq: 2, Role: "assistant", callIDs: []string{"tc-1", "tc-2"}},
+	}
+	evts := []Event{
+		{ID: "r1", EventType: "llm_response",
+			Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"tc-2"}]}`)},
+	}
+	annotateAssistantToolCalls(msgs, evts)
+	if msgs[1].ToolCalls != nil {
+		t.Fatalf("tool_calls = %s, want none: only one of the row's two calls paired", msgs[1].ToolCalls)
+	}
+}
+
+// A row storing an id Core made up for the call itself gets no field, even
+// when a provider entry carries the same string: that entry is another call.
+func TestAnnotateAssistantToolCalls_IDsCoreMadeUpJoinNoEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stored string
+		evts   []Event
+	}{
+		{
+			// The provider's call-1 was rejected and got no row; the row ran
+			// the first call of a later response that carried no id.
+			name:   "a provider id equal to Core's name for an id-less call",
+			stored: "call-1",
+			evts: []Event{
+				{ID: "r1", EventType: "llm_response",
+					Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"call-1","type":"function","function":{"name":"inventory__delete-item"}}]}`)},
+				{ID: "r2", EventType: "llm_response",
+					Payload: json.RawMessage(`{"native_tool_calls_raw":[{"type":"function","function":{"name":"inventory__list-items"}}]}`)},
+			},
+		},
+		{
+			// Core runs function calls only and numbers them among
+			// themselves: the id-less function call is its call-1, not the
+			// entry before it.
+			name:   "an id-less call after an entry Core does not run",
+			stored: "call-1",
+			evts: []Event{
+				{ID: "r1", EventType: "llm_response",
+					Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"call-1","type":"custom"},{"type":"function","function":{"name":"inventory__list-items"}}]}`)},
+			},
+		},
+		{
+			// Core's planner ran the call; no response carries it.
+			name:   "a planner call",
+			stored: "planner-inventory-list-items",
+			evts: []Event{
+				{ID: "r1", EventType: "llm_response",
+					Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"planner-inventory-list-items","type":"function","function":{"name":"inventory__delete-item"}}]}`)},
+			},
+		},
+		{
+			name:   "a pipeline step",
+			stored: "pipeline-inventory-list-items",
+			evts: []Event{
+				{ID: "r1", EventType: "llm_response",
+					Payload: json.RawMessage(`{"native_tool_calls_raw":[{"id":"pipeline-inventory-list-items","type":"function","function":{"name":"inventory__delete-item"}}]}`)},
+			},
+		},
+	} {
+		msgs := []Message{{Seq: 1, Role: "assistant", callIDs: []string{tc.stored}}}
+		annotateAssistantToolCalls(msgs, tc.evts)
+		if msgs[0].ToolCalls != nil {
+			t.Errorf("%s: tool_calls = %s, want none", tc.name, msgs[0].ToolCalls)
+		}
+	}
+}
+
+// madeUpByCore recognizes exactly the ids Core makes up, and no provider id.
+func TestMadeUpByCore(t *testing.T) {
+	for id, want := range map[string]bool{
+		"call-1":                        true,
+		"call-12":                       true,
+		"planner-inventory-list-items":  true,
+		"pipeline-inventory-list-items": true,
+		"call-":                         false,
+		"call-1a":                       false,
+		"call_1":                        false,
+		"call_abc123":                   false,
+		"chatcmpl-tool-1":               false,
+		"toolu_01":                      false,
+		"":                              false,
+	} {
+		if got := madeUpByCore(id); got != want {
+			t.Errorf("madeUpByCore(%q) = %v, want %v", id, got, want)
+		}
+	}
+}
+
+// pairMsg is one messages row of a tool-call pairing fixture. toolCalls is
+// the stored messages.tool_calls value in Core's normalized shape; an empty
+// string stores NULL, as do empty toolCallID and metadata.
+type pairMsg struct {
+	role, content, toolCalls, toolCallID, metadata string
+}
+
+// pairEvt is one session_events row of a tool-call pairing fixture. An empty
+// parent stores NULL; an empty payload stores a bare header.
+type pairEvt struct {
+	id, typ, parent, payload string
+}
+
+// rawCall is one native_tool_calls_raw entry in the provider's wire shape.
+func rawCall(id, name string) string {
+	return fmt.Sprintf(`{"id":%q,"type":"function","function":{"name":%q,"arguments":"{}"}}`, id, name)
+}
+
+// rawCallNoID is a wire-shape entry from a provider that sends no call id.
+func rawCallNoID(name string) string {
+	return fmt.Sprintf(`{"type":"function","function":{"name":%q,"arguments":"{}"}}`, name)
+}
+
+// jsonArray joins already-encoded JSON values into an array.
+func jsonArray(entries ...string) string {
+	return "[" + strings.Join(entries, ",") + "]"
+}
+
+// llmCalls is the payload of a main-loop llm_response that called tools.
+func llmCalls(entries ...string) string {
+	return `{"v":1,"finish_reason":"tool_calls","native_tool_calls_raw":` + jsonArray(entries...) + `}`
+}
+
+// storedCall is the messages.tool_calls value Core writes on a dispatch row.
+func storedCall(id, name string) string {
+	return fmt.Sprintf(`[{"id":%q,"name":%q,"arguments":{}}]`, id, name)
+}
+
+// confirmMeta is the metadata Core stores on a tool confirmation question.
+func confirmMeta(callID string) string {
+	return fmt.Sprintf(`{"type":"confirmation","prompt_type":"tool_confirmation","tool_call_id":%q,"options":"approve,reject"}`, callID)
+}
+
+const (
+	llmText     = `{"v":1,"finish_reason":"stop"}`
+	approveMeta = `{"prompt_type":"confirmation_response","action":"approve"}`
+)
+
+// TestGetSession_ToolCallsPairedByCallID pins which assistant row receives
+// which tool calls, on fixtures shaped like the transcripts and event logs
+// the orchestrator writes. Rows are joined to llm_response entries by the
+// call ids in the stored messages.tool_calls column; counting rows against
+// responses breaks wherever the two do not line up one to one.
+//
+// The main case is a write confirmation. The response that proposes the
+// call is followed by a question row that runs nothing (its wording comes
+// from a second, un-nested LLM call); the call runs, and its row is written,
+// on the next turn after the user approves, with no main-loop response of
+// its own. Paired by position, the call lands on the question and the row
+// that ran it shows none — and when the question was not narrated by the
+// LLM, every later row shifts as well.
+//
+// Further cases pin what a row that cannot be placed gets: nothing — a row
+// whose id several entries carry, a row from a provider that sends no call
+// ids (Core then names the calls "call-1", … itself, and the entries carry
+// nothing to join on), and a row that stores no call id at all.
+//
+// want maps a message seq to the tool_calls it must carry; every other row,
+// the synthetic error row included, must carry none.
+func TestGetSession_ToolCallsPairedByCallID(t *testing.T) {
+	var (
+		del    = rawCall("call-del", "inventory__delete-item")
+		list   = rawCall("call-list", "inventory__list-items")
+		count  = rawCall("call-count", "inventory__count-items")
+		older  = rawCall("call-old", "inventory__list-items")
+		first  = rawCall("call-a", "inventory__list-items")
+		second = rawCall("call-b", "inventory__list-containers")
+		reused = rawCall("call_0", "inventory__list-items")
+		again  = rawCall("call_0", "inventory__list-containers")
+		gated  = rawCall("call_0", "inventory__delete-item")
+		other  = rawCall("call_1", "inventory__count-items")
+		noID   = rawCallNoID("inventory__delete-item")
+		noIDRd = rawCallNoID("inventory__list-items")
+	)
+
+	// Every turn opens with user_message and closes with turn_finished.
+	//
+	// The turn that proposes the write and asks about it: the proposing
+	// response, the un-nested narration of the question, the request.
+	askTurn := func(proposal, narration pairEvt, callID string) []pairEvt {
+		return []pairEvt{
+			{"u1", "user_message", "", ""},
+			{"t1", "turn_start", "u1", ""},
+			proposal,
+			narration,
+			{"q1", "confirmation_requested", "r1", fmt.Sprintf(`{"v":1,"tool_call_id":%q}`, callID)},
+			{"f1", "turn_finished", "u1", ""},
+		}
+	}
+	narrated := pairEvt{"n1", "llm_response", "r1", llmText}
+	unnarrated := pairEvt{"n1", "llm_error", "r1", `{"v":1,"response_body_excerpt":"timeout"}`}
+	// The approving turn: the classifier side-call nested under its
+	// sentinel, the resolution nested under the request (resolvedUnder),
+	// the run, then the agent loop's summary response.
+	approveTurn := func(callID, resolvedUnder string) []pairEvt {
+		return []pairEvt{
+			{"u2", "user_message", "", ""},
+			{"k1", "confirmation_classification_invoked", "u2", ""},
+			{"k2", "llm_response", "k1", llmText},
+			{"q2", "confirmation_resolved", resolvedUnder, fmt.Sprintf(`{"v":2,"choice":"approve","tool_call_id":%q}`, callID)},
+			{"x1", "tool_call_extracted", "u2", fmt.Sprintf(`{"v":1,"call_id":%q}`, callID)},
+			{"x2", "tool_call_result", "x1", fmt.Sprintf(`{"v":1,"call_id":%q,"status":"ok"}`, callID)},
+			{"t2", "turn_start", "u2", ""},
+			{"r2", "llm_response", "t2", llmText},
+			{"f2", "turn_finished", "u2", ""},
+		}
+	}
+	rejectTurn := func(callID string) []pairEvt {
+		return []pairEvt{
+			{"u2", "user_message", "", ""},
+			{"q2", "confirmation_resolved", "q1", fmt.Sprintf(`{"v":2,"choice":"reject","tool_call_id":%q}`, callID)},
+			{"f2", "turn_finished", "u2", ""},
+		}
+	}
+	// A read round in a turn of its own, to show whether the pairing has
+	// shifted.
+	listTurn := func(entry, callID string) []pairEvt {
+		return []pairEvt{
+			{"u3", "user_message", "", ""},
+			{"t3", "turn_start", "u3", ""},
+			{"r3", "llm_response", "t3", llmCalls(entry)},
+			{"x3", "tool_call_extracted", "r3", fmt.Sprintf(`{"v":1,"call_id":%q}`, callID)},
+			{"x4", "tool_call_result", "x3", fmt.Sprintf(`{"v":1,"call_id":%q,"status":"ok"}`, callID)},
+			{"r4", "llm_response", "r3", llmText},
+			{"f3", "turn_finished", "u3", ""},
+		}
+	}
+	// approvedMsgs is the transcript of a proposed, approved and run write
+	// followed by a read round; delID and listID are the stored call ids.
+	approvedMsgs := func(delID, listID string) []pairMsg {
+		return []pairMsg{
+			{"user", "delete the old printer", "", "", ""},
+			{"assistant", `Delete the item "Old printer"?`, "", "", confirmMeta(delID)},
+			{"user", "yes", "", "", approveMeta},
+			{"assistant", "", storedCall(delID, "inventory__delete-item"), "", ""},
+			{"tool", `{"deleted":1}`, "", delID, ""},
+			{"assistant", "The old printer has been deleted.", "", "", ""},
+			{"user", "list the printers", "", "", ""},
+			{"assistant", "", storedCall(listID, "inventory__list-items"), "", ""},
+			{"tool", "[]", "", listID, ""},
+			{"assistant", "There are no printers left.", "", "", ""},
+		}
+	}
+	// rejectedMsgs is the transcript of a rejected write followed by a read
+	// round. A rejection writes no rows, and a transcript Core rewrites (a
+	// summary, a rollback) keeps no metadata, so the question has lost its
+	// marker.
+	rejectedMsgs := func(listID string) []pairMsg {
+		return []pairMsg{
+			{"user", "delete the old printer", "", "", ""},
+			{"assistant", `Delete the item "Old printer"?`, "", "", ""},
+			{"user", "list the printers", "", "", ""},
+			{"assistant", "", storedCall(listID, "inventory__list-items"), "", ""},
+			{"tool", "[]", "", listID, ""},
+			{"assistant", "Here are the printers.", "", "", ""},
+		}
+	}
+	// interruptedMsgs is the transcript of a response that proposed a write
+	// and a read: the write is gated first, so the read is recorded as not
+	// executed, ahead of the question.
+	interruptedMsgs := func(delID, countID string) []pairMsg {
+		return []pairMsg{
+			{"user", "delete the old printer and count what is left", "", "", ""},
+			{"assistant", "", storedCall(countID, "inventory__count-items"), "", ""},
+			{"tool", "NOT EXECUTED", "", countID, ""},
+			{"assistant", `Delete the item "Old printer"?`, "", "", confirmMeta(delID)},
+			{"user", "yes", "", "", approveMeta},
+			{"assistant", "", storedCall(delID, "inventory__delete-item"), "", ""},
+			{"tool", `{"deleted":1}`, "", delID, ""},
+			{"assistant", "Deleted. Ask again for the count.", "", "", ""},
+		}
+	}
+	// multiCallTurn is one response with two calls, each run and recorded
+	// as a row of its own.
+	multiCallTurn := func(a, aID, b, bID string) []pairEvt {
+		return []pairEvt{
+			{"u1", "user_message", "", ""},
+			{"t1", "turn_start", "u1", ""},
+			{"r1", "llm_response", "t1", llmCalls(a, b)},
+			{"x1", "tool_call_extracted", "r1", fmt.Sprintf(`{"v":1,"call_id":%q}`, aID)},
+			{"x2", "tool_call_extracted", "r1", fmt.Sprintf(`{"v":1,"call_id":%q}`, bID)},
+			{"r2", "llm_response", "r1", llmText},
+			{"f1", "turn_finished", "u1", ""},
+		}
+	}
+	multiCallMsgs := func(aID, bID string) []pairMsg {
+		return []pairMsg{
+			{"user", "show printers and scanners", "", "", ""},
+			{"assistant", "Looking both up.", storedCall(aID, "inventory__list-items"), "", ""},
+			{"tool", "[]", "", aID, ""},
+			{"assistant", "Looking both up.", storedCall(bID, "inventory__list-containers"), "", ""},
+			{"tool", "[]", "", bID, ""},
+			{"assistant", "Neither exists.", "", "", ""},
+		}
+	}
+	// oldTurn is a finished read round whose rows were later trimmed away.
+	oldTurn := func(entry, callID string) []pairEvt {
+		return []pairEvt{
+			{"u0", "user_message", "", ""},
+			{"t0", "turn_start", "u0", ""},
+			{"r0", "llm_response", "t0", llmCalls(entry)},
+			{"x0", "tool_call_extracted", "r0", fmt.Sprintf(`{"v":1,"call_id":%q}`, callID)},
+			{"r0b", "llm_response", "r0", llmText},
+			{"f0", "turn_finished", "u0", ""},
+		}
+	}
+	listOnlyMsgs := func(listID string) []pairMsg {
+		return []pairMsg{
+			{"user", "list the printers", "", "", ""},
+			{"assistant", "", storedCall(listID, "inventory__list-items"), "", ""},
+			{"tool", "[]", "", listID, ""},
+			{"assistant", "No printers.", "", "", ""},
+		}
+	}
+	concat := func(parts ...[]pairEvt) []pairEvt { return slices.Concat(parts...) }
+
+	for _, tc := range []struct {
+		name     string
+		firstSeq int // seq of the first message row; 0 means 1
+		msgs     []pairMsg
+		hidden   []int // indexes into msgs of rows stored as hidden
+		evts     []pairEvt
+		want     map[int]string
+	}{
+		{
+			name: "approved write: the call is on the row that ran it, not on the question",
+			msgs: approvedMsgs("call-del", "call-list"),
+			evts: concat(askTurn(pairEvt{"r1", "llm_response", "t1", llmCalls(del)}, narrated, "call-del"),
+				approveTurn("call-del", "q1"), listTurn(list, "call-list")),
+			want: map[int]string{4: jsonArray(del), 8: jsonArray(list)},
+		},
+		{
+			// The narration call failed, so the question is a fixed template
+			// and the turn holds an llm_error instead of a second response.
+			// By position every row from the question on shifts by one.
+			name: "approved write with an un-narrated question: later rows keep their calls",
+			msgs: approvedMsgs("call-del", "call-list"),
+			evts: concat(askTurn(pairEvt{"r1", "llm_response", "t1", llmCalls(del)}, unnarrated, "call-del"),
+				approveTurn("call-del", "q1"), listTurn(list, "call-list")),
+			want: map[int]string{4: jsonArray(del), 8: jsonArray(list)},
+		},
+		{
+			name: "rejected write: the question gets nothing and the next round keeps its call",
+			msgs: rejectedMsgs("call-list"),
+			evts: concat(askTurn(pairEvt{"r1", "llm_response", "t1", llmCalls(del)}, narrated, "call-del"),
+				rejectTurn("call-del"), listTurn(list, "call-list")),
+			want: map[int]string{4: jsonArray(list)},
+		},
+		{
+			name: "a call interrupted by the question keeps only its own entry",
+			msgs: interruptedMsgs("call-del", "call-count"),
+			evts: concat(askTurn(pairEvt{"r1", "llm_response", "t1", llmCalls(del, count)}, narrated, "call-del"),
+				approveTurn("call-del", "q1")),
+			want: map[int]string{2: jsonArray(count), 6: jsonArray(del)},
+		},
+		{
+			name: "a multi-call response written as one row per call",
+			msgs: multiCallMsgs("call-a", "call-b"),
+			evts: multiCallTurn(first, "call-a", second, "call-b"),
+			want: map[int]string{2: jsonArray(first), 4: jsonArray(second)},
+		},
+		{
+			name:     "trimmed history: rows gone from the front, their events kept",
+			firstSeq: 7,
+			msgs:     listOnlyMsgs("call-list"),
+			evts:     concat(oldTurn(older, "call-old"), listTurn(list, "call-list")),
+			want:     map[int]string{8: jsonArray(list)},
+		},
+		{
+			name: "an id reused across rounds pairs no row",
+			msgs: []pairMsg{
+				{"user", "list printers", "", "", ""},
+				{"assistant", "", storedCall("call_0", "inventory__list-items"), "", ""},
+				{"tool", "[]", "", "call_0", ""},
+				{"assistant", "No printers.", "", "", ""},
+				{"user", "and scanners?", "", "", ""},
+				{"assistant", "", storedCall("call_0", "inventory__list-containers"), "", ""},
+				{"tool", "[]", "", "call_0", ""},
+				{"assistant", "No scanners either.", "", "", ""},
+			},
+			evts: []pairEvt{
+				{"t1", "turn_start", "", ""},
+				{"r1", "llm_response", "t1", llmCalls(reused)},
+				{"r2", "llm_response", "r1", llmText},
+				{"t2", "turn_start", "", ""},
+				{"r3", "llm_response", "t2", llmCalls(again)},
+				{"r4", "llm_response", "r3", llmText},
+			},
+			want: map[int]string{},
+		},
+		{
+			// Retention has pruned the first round's events but kept its
+			// rows: one entry carries call_0 and two rows store it. The
+			// entry cannot tell which row it belongs to, so neither gets it.
+			name: "an id two rows store, with one entry left, pairs no row",
+			msgs: []pairMsg{
+				{"user", "list printers", "", "", ""},
+				{"assistant", "", storedCall("call_0", "inventory__list-items"), "", ""},
+				{"tool", "[]", "", "call_0", ""},
+				{"assistant", "No printers.", "", "", ""},
+				{"user", "and scanners?", "", "", ""},
+				{"assistant", "", storedCall("call_0", "inventory__list-containers"), "", ""},
+				{"tool", "[]", "", "call_0", ""},
+				{"assistant", "No scanners either.", "", "", ""},
+			},
+			evts: []pairEvt{
+				{"t2", "turn_start", "", ""},
+				{"r3", "llm_response", "t2", llmCalls(again)},
+				{"r4", "llm_response", "r3", llmText},
+			},
+			want: map[int]string{},
+		},
+		{
+			// A write waits for approval while a system-injected turn runs a
+			// read; both calls are call_0. The read's row is written first,
+			// the approved write's row a turn later, so the rows are not in
+			// the order of the responses: neither row can be told apart.
+			name: "an id reused across a pending confirmation pairs no row",
+			msgs: []pairMsg{
+				{"user", "delete the old printer", "", "", ""},
+				{"assistant", `Delete the item "Old printer"?`, "", "", confirmMeta("call_0")},
+				{"user", "The export has finished.", "", "", ""},
+				{"assistant", "", storedCall("call_0", "inventory__list-items"), "", ""},
+				{"tool", "[]", "", "call_0", ""},
+				{"assistant", "The export is ready.", "", "", ""},
+				{"user", "yes", "", "", approveMeta},
+				{"assistant", "", storedCall("call_0", "inventory__delete-item"), "", ""},
+				{"tool", `{"deleted":1}`, "", "call_0", ""},
+				{"assistant", "The old printer has been deleted.", "", "", ""},
+			},
+			hidden: []int{2},
+			evts: concat(
+				askTurn(pairEvt{"r1", "llm_response", "t1", llmCalls(gated)}, narrated, "call_0"),
+				[]pairEvt{
+					{"u3", "user_message", "", ""},
+					{"t3", "turn_start", "u3", ""},
+					{"r3", "llm_response", "t3", llmCalls(reused)},
+					{"x3", "tool_call_extracted", "r3", `{"v":1,"call_id":"call_0"}`},
+					{"r4", "llm_response", "r3", llmText},
+					{"f3", "turn_finished", "u3", ""},
+				},
+				approveTurn("call_0", "q1")),
+			want: map[int]string{},
+		},
+		{
+			// call_0 now names two entries but one row: the rejected write
+			// left none. Which entry the row belongs to cannot be told, so
+			// it gets nothing; the unambiguous call_1 is still paired.
+			name: "an id reused across rounds is left out once a call lost its row",
+			msgs: []pairMsg{
+				{"user", "delete the old printer", "", "", ""},
+				{"assistant", `Delete the item "Old printer"?`, "", "", ""},
+				{"user", "list and count the printers", "", "", ""},
+				{"assistant", "", storedCall("call_0", "inventory__list-items"), "", ""},
+				{"tool", "[]", "", "call_0", ""},
+				{"assistant", "", storedCall("call_1", "inventory__count-items"), "", ""},
+				{"tool", "0", "", "call_1", ""},
+				{"assistant", "There are no printers.", "", "", ""},
+			},
+			evts: concat(
+				askTurn(pairEvt{"r1", "llm_response", "t1", llmCalls(gated)}, narrated, "call_0"),
+				rejectTurn("call_0"),
+				[]pairEvt{
+					{"u3", "user_message", "", ""},
+					{"t3", "turn_start", "u3", ""},
+					{"r3", "llm_response", "t3", llmCalls(reused, other)},
+					{"r4", "llm_response", "r3", llmText},
+					{"f3", "turn_finished", "u3", ""},
+				}),
+			want: map[int]string{6: jsonArray(other)},
+		},
+		{
+			// No entry carries an id, so Core named the calls itself
+			// ("call-1" in each response). That name joins nothing: every
+			// row gets no field rather than a call of another response.
+			name: "provider without call ids: no row gets calls",
+			msgs: approvedMsgs("call-1", "call-1"),
+			evts: concat(askTurn(pairEvt{"r1", "llm_response", "t1", llmCalls(noID)}, narrated, "call-1"),
+				approveTurn("call-1", "q1"), listTurn(noIDRd, "call-1")),
+			want: map[int]string{},
+		},
+		{
+			// Core stores the call ids on every row that runs a native call, so
+			// a row storing none ran no call. Here the rows that did were
+			// trimmed away while their events stay; counted by position, the
+			// text answer left over would get the trimmed round's call.
+			name:     "rows storing no call id: a text answer left after trimming gets no call",
+			firstSeq: 9,
+			msgs: []pairMsg{
+				{"user", "thanks", "", "", ""},
+				{"assistant", "You are welcome.", "", "", ""},
+			},
+			evts: concat(listTurn(list, "call-list"), []pairEvt{
+				{"u5", "user_message", "", ""},
+				{"t5", "turn_start", "u5", ""},
+				{"r7", "llm_response", "t5", llmText},
+				{"f5", "turn_finished", "u5", ""},
+			}),
+			want: map[int]string{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTestHandler(t)
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, err := h.db.Exec(q, args...); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			}
+			orNull := func(s string) any {
+				if s == "" {
+					return nil
+				}
+				return s
+			}
+			exec(`INSERT INTO sessions VALUES ('sess_pair','pairing',NULL,'model-x','{}','user_1','group_1','2024-09-01T10:00:00Z','2024-09-01T10:30:00Z','chat',NULL)`)
+			firstSeq := tc.firstSeq
+			if firstSeq == 0 {
+				firstSeq = 1
+			}
+			// Message i is written at second 2i+1 and event i at second 2i,
+			// so the two logs interleave harmlessly; only the synthetic
+			// error row's place depends on it.
+			for i, m := range tc.msgs {
+				var visibility any
+				if slices.Contains(tc.hidden, i) {
+					visibility = "hidden"
+				}
+				exec(`INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, metadata, visibility, created_at) VALUES ('sess_pair',?,?,?,?,?,?,?,?)`,
+					firstSeq+i, m.role, m.content, orNull(m.toolCalls), orNull(m.toolCallID), orNull(m.metadata), visibility,
+					fmt.Sprintf("2024-09-01T10:%02d:%02dZ", (2*i+1)/60, (2*i+1)%60))
+			}
+			for i, e := range tc.evts {
+				payload := e.payload
+				if payload == "" {
+					payload = `{"v":1}`
+				}
+				ts := fmt.Sprintf("2024-09-01T10:%02d:%02dZ", (2*i)/60, (2*i)%60)
+				exec(`INSERT INTO session_events VALUES (?,'sess_pair',?,?,?,?,0,?,?)`,
+					e.id, i+1, ts, e.typ, orNull(e.parent), payload, ts)
+			}
+
+			w := do(t, h, "/sessions/sess_pair")
+			mustStatus(t, w, http.StatusOK)
+			var s SessionDetail
+			mustUnmarshal(t, w.Body.Bytes(), &s)
+
+			found := 0
+			for _, m := range s.Messages {
+				if m.Role != "error" && slices.Contains(tc.hidden, m.Seq-firstSeq) {
+					t.Errorf("seq %d is stored as hidden but was served", m.Seq)
+				}
+				want, ok := tc.want[m.Seq]
+				if !ok || m.Role == "error" {
+					if len(m.ToolCalls) != 0 {
+						t.Errorf("seq %d (%s %q) tool_calls = %s, want none", m.Seq, m.Role, m.Content, m.ToolCalls)
+					}
+					continue
+				}
+				found++
+				var got, exp bytes.Buffer
+				if err := json.Compact(&exp, []byte(want)); err != nil {
+					t.Fatalf("bad want for seq %d: %v", m.Seq, err)
+				}
+				if err := json.Compact(&got, m.ToolCalls); err != nil || got.String() != exp.String() {
+					t.Errorf("seq %d (%s %q) tool_calls = %s, want %s", m.Seq, m.Role, m.Content, m.ToolCalls, want)
+				}
+			}
+			if found != len(tc.want) {
+				t.Errorf("matched %d of the %d expected rows; messages = %+v", found, len(tc.want), s.Messages)
+			}
+			// omitempty contract: the key appears only on the rows that
+			// carry calls, so every other row stays byte-identical.
+			if n := strings.Count(w.Body.String(), `"tool_calls":`); n != len(tc.want) {
+				t.Errorf("tool_calls JSON key appears %d times, want %d", n, len(tc.want))
+			}
+		})
 	}
 }
 
