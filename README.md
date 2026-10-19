@@ -149,6 +149,8 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
         "tool_call_count": 12,
         "tokens_in_total": 5234,
         "tokens_out_total": 1024,
+        "cache_write_tokens_total": 812,   // sum of the llm_response cache_write_tokens; 0 for events without the field
+        "cache_read_tokens_total": 3904,   // same for cache_read_tokens
         "cost_input_total": 0.0123,
         "cost_output_total": 0.045
       },
@@ -231,6 +233,8 @@ To answer "what's going wrong in conversations" in one round-trip instead of N p
   "tool_call_count": 412,
   "tokens_in_total": ...,
   "tokens_out_total": ...,
+  "cache_write_tokens_total": ...,
+  "cache_read_tokens_total": ...,
   "cost_input_total": ...,
   "cost_output_total": ...,
   "by_event_type": [
@@ -268,11 +272,12 @@ Exceeding the cap returns 400.
 {
   "session_count": 1, "event_count": 2, "llm_call_count": 2, "tool_call_count": 0,
   "tokens_in_total": 300, "tokens_out_total": 150,
+  "cache_write_tokens_total": 20, "cache_read_tokens_total": 60,
   "cost_input_total": 0.030, "cost_output_total": 0.060,
   "time_buckets": [
-    {"bucket":"2026-05-10","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":100,"tokens_out_total":50,"cost_input_total":0.010,"cost_output_total":0.020},
-    {"bucket":"2026-05-11","session_count":0,"event_count":0,"llm_call_count":0,"tool_call_count":0,"tokens_in_total":0,"tokens_out_total":0,"cost_input_total":0,"cost_output_total":0},
-    {"bucket":"2026-05-12","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":200,"tokens_out_total":100,"cost_input_total":0.020,"cost_output_total":0.040},
+    {"bucket":"2026-05-10","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":100,"tokens_out_total":50,"cache_write_tokens_total":20,"cache_read_tokens_total":60,"cost_input_total":0.010,"cost_output_total":0.020},
+    {"bucket":"2026-05-11","session_count":0,"event_count":0,"llm_call_count":0,"tool_call_count":0,"tokens_in_total":0,"tokens_out_total":0,"cache_write_tokens_total":0,"cache_read_tokens_total":0,"cost_input_total":0,"cost_output_total":0},
+    {"bucket":"2026-05-12","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":200,"tokens_out_total":100,"cache_write_tokens_total":0,"cache_read_tokens_total":0,"cost_input_total":0.020,"cost_output_total":0.040},
     {"bucket":"2026-05-13","session_count":0, …},
     …
   ]

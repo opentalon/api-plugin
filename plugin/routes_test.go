@@ -114,10 +114,15 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 		return fmt.Sprintf(`{"v":1,"raw_content_excerpt":"x","tokens_in":%d,"tokens_out":%d,"cost_input":%g,"cost_output":%g,"latency_ms":100}`,
 			tokIn, tokOut, costIn, costOut)
 	}
+	// sess_a's payloads carry cache token counts; sess_b's v1 payload has none.
+	llmPayloadCached := func(tokIn, tokOut, cacheWrite, cacheRead int, costIn, costOut float64) string {
+		return fmt.Sprintf(`{"v":2,"raw_content_excerpt":"x","tokens_in":%d,"tokens_out":%d,"cache_write_tokens":%d,"cache_read_tokens":%d,"cost_input":%g,"cost_output":%g,"latency_ms":100}`,
+			tokIn, tokOut, cacheWrite, cacheRead, costIn, costOut)
+	}
 	exec(`INSERT INTO session_events VALUES ('evt_a1','sess_a',1,'2024-01-01T10:00:00Z','llm_response',NULL,100,?,'2024-01-01T10:00:00Z')`,
-		llmPayload(1000, 500, 0.0025, 0.005))
+		llmPayloadCached(1000, 500, 100, 600, 0.0025, 0.005))
 	exec(`INSERT INTO session_events VALUES ('evt_a2','sess_a',2,'2024-01-01T10:10:00Z','llm_response',NULL,150,?,'2024-01-01T10:10:00Z')`,
-		llmPayload(2000, 1000, 0.005, 0.010))
+		llmPayloadCached(2000, 1000, 300, 1500, 0.005, 0.010))
 	exec(`INSERT INTO session_events VALUES ('evt_b1','sess_b',1,'2024-02-01T10:00:00Z','llm_response',NULL,200,?,'2024-02-01T10:00:00Z')`,
 		llmPayload(500, 250, 0.00125, 0.0025))
 	exec(`INSERT INTO session_events VALUES ('evt_b2','sess_b',2,'2024-02-01T10:00:10Z','tool_call_result','evt_b1',50,'{"v":1,"result":"ok"}','2024-02-01T10:00:10Z')`)
@@ -217,6 +222,10 @@ func TestListSessions_StatsRollupPerRow(t *testing.T) {
 	if a.Stats.CostOutputTotal != 0.015 {
 		t.Errorf("sess_a cost_output_total = %v, want 0.015", a.Stats.CostOutputTotal)
 	}
+	if a.Stats.CacheWriteTokensTotal != 400 || a.Stats.CacheReadTokensTotal != 2100 {
+		t.Errorf("sess_a cache tokens (write, read) = (%d, %d), want (400, 2100)",
+			a.Stats.CacheWriteTokensTotal, a.Stats.CacheReadTokensTotal)
+	}
 	// sess_b: 1 llm_response (tool_call_result is counted separately), 1 tool_call_result.
 	b := resp.Items[0]
 	if b.Stats.LLMCallCount != 1 {
@@ -224,6 +233,10 @@ func TestListSessions_StatsRollupPerRow(t *testing.T) {
 	}
 	if b.Stats.ToolCallCount != 1 {
 		t.Errorf("sess_b tool_call_count = %d, want 1", b.Stats.ToolCallCount)
+	}
+	if b.Stats.CacheWriteTokensTotal != 0 || b.Stats.CacheReadTokensTotal != 0 {
+		t.Errorf("sess_b cache tokens (write, read) = (%d, %d), want (0, 0) for a payload without cache fields",
+			b.Stats.CacheWriteTokensTotal, b.Stats.CacheReadTokensTotal)
 	}
 }
 
@@ -248,6 +261,10 @@ func TestListSessions_TotalsCoverFullFilteredSet(t *testing.T) {
 	wantTokensIn := int64(3000 + 500)
 	if resp.Totals.TokensInTotal != wantTokensIn {
 		t.Errorf("Totals.TokensInTotal = %d, want %d", resp.Totals.TokensInTotal, wantTokensIn)
+	}
+	if resp.Totals.CacheWriteTokensTotal != 400 || resp.Totals.CacheReadTokensTotal != 2100 {
+		t.Errorf("Totals cache tokens (write, read) = (%d, %d), want (400, 2100)",
+			resp.Totals.CacheWriteTokensTotal, resp.Totals.CacheReadTokensTotal)
 	}
 }
 
@@ -889,6 +906,10 @@ func TestGetSession_FullDetail(t *testing.T) {
 	}
 	if s.Stats.LLMCallCount != 2 {
 		t.Errorf("Stats.LLMCallCount = %d, want 2", s.Stats.LLMCallCount)
+	}
+	if s.Stats.CacheWriteTokensTotal != 400 || s.Stats.CacheReadTokensTotal != 2100 {
+		t.Errorf("Stats cache tokens (write, read) = (%d, %d), want (400, 2100)",
+			s.Stats.CacheWriteTokensTotal, s.Stats.CacheReadTokensTotal)
 	}
 	// Payload is inlined as raw JSON, not double-escaped.
 	if len(s.Events[0].Payload) == 0 || s.Events[0].Payload[0] != '{' {
@@ -1602,6 +1623,10 @@ func TestEventsStats_CrossSessionTotals(t *testing.T) {
 	if stats.TokensInTotal != 3500 {
 		t.Errorf("TokensInTotal = %d, want 3500", stats.TokensInTotal)
 	}
+	if stats.CacheWriteTokensTotal != 400 || stats.CacheReadTokensTotal != 2100 {
+		t.Errorf("cache tokens (write, read) = (%d, %d), want (400, 2100)",
+			stats.CacheWriteTokensTotal, stats.CacheReadTokensTotal)
+	}
 }
 
 func TestEventsStats_FilteredByGroup(t *testing.T) {
@@ -2015,16 +2040,21 @@ func seedBucketEvents(t *testing.T, db *sql.DB) {
 		return fmt.Sprintf(`{"v":1,"tokens_in":%d,"tokens_out":%d,"cost_input":%g,"cost_output":%g}`,
 			tokIn, tokOut, costIn, costOut)
 	}
+	// Only evt_bk_a1 and evt_bk_b1 carry cache token counts.
+	llmCached := func(tokIn, tokOut, cacheWrite, cacheRead int, costIn, costOut float64) string {
+		return fmt.Sprintf(`{"v":2,"tokens_in":%d,"tokens_out":%d,"cache_write_tokens":%d,"cache_read_tokens":%d,"cost_input":%g,"cost_output":%g}`,
+			tokIn, tokOut, cacheWrite, cacheRead, costIn, costOut)
+	}
 
 	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','',NULL,'gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a1','sess_bk_alice',1,'2026-05-10T10:00:00Z','llm_response',NULL,100,?,'2026-05-10T10:00:00Z')`,
-		llm(100, 50, 0.010, 0.020))
+		llmCached(100, 50, 20, 60, 0.010, 0.020))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a2','sess_bk_alice',2,'2026-05-12T10:00:00Z','llm_response',NULL,100,?,'2026-05-12T10:00:00Z')`,
 		llm(200, 100, 0.020, 0.040))
 
 	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','',NULL,'gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z','chat',NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b1','sess_bk_bob',1,'2026-05-14T10:00:00Z','llm_response',NULL,200,?,'2026-05-14T10:00:00Z')`,
-		llm(300, 150, 0.030, 0.060))
+		llmCached(300, 150, 40, 250, 0.030, 0.060))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b2','sess_bk_bob',2,'2026-05-14T11:00:00Z','tool_call_result','evt_bk_b1',50,'{"v":1,"result":"ok"}','2026-05-14T11:00:00Z')`)
 
 	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','',NULL,'gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z','chat',NULL)`)
@@ -2078,6 +2108,35 @@ func TestEventsStats_BucketByDay_BucketsAndOrdering(t *testing.T) {
 	for i, want := range wantKeys {
 		if stats.TimeBuckets[i].Bucket != want {
 			t.Errorf("TimeBuckets[%d].Bucket = %q, want %q", i, stats.TimeBuckets[i].Bucket, want)
+		}
+	}
+}
+
+// Every bucket carries both cache totals; a day whose only llm_response has
+// no cache fields (2026-05-12) counts zero like the empty days.
+func TestEventsStats_BucketByDay_CacheTokens(t *testing.T) {
+	h := newBucketHandler(t)
+	w := do(t, h, "/events/stats?bucket_by=day&since=2026-05-10T00:00:00Z&until=2026-05-17T00:00:00Z")
+	mustStatus(t, w, http.StatusOK)
+	var stats EventStats
+	mustUnmarshal(t, w.Body.Bytes(), &stats)
+
+	want := map[string][2]int64{
+		"2026-05-10": {20, 60},
+		"2026-05-11": {0, 0},
+		"2026-05-12": {0, 0},
+		"2026-05-13": {0, 0},
+		"2026-05-14": {40, 250},
+		"2026-05-15": {0, 0},
+		"2026-05-16": {0, 0},
+	}
+	if len(stats.TimeBuckets) != len(want) {
+		t.Fatalf("len(TimeBuckets) = %d, want %d", len(stats.TimeBuckets), len(want))
+	}
+	for _, b := range stats.TimeBuckets {
+		got := [2]int64{b.CacheWriteTokensTotal, b.CacheReadTokensTotal}
+		if got != want[b.Bucket] {
+			t.Errorf("bucket %s cache tokens (write, read) = %v, want %v", b.Bucket, got, want[b.Bucket])
 		}
 	}
 }
@@ -2317,11 +2376,12 @@ func TestEventsStats_BucketByDay_SumConsistency(t *testing.T) {
 	mustUnmarshal(t, w.Body.Bytes(), &stats)
 
 	var (
-		sumEvent          int64
-		sumLLM, sumTool   int64
-		sumTokIn, sumTout int64
-		sumCostIn, sumCo  float64
-		sumSession        int
+		sumEvent             int64
+		sumLLM, sumTool      int64
+		sumTokIn, sumTout    int64
+		sumCacheW, sumCacheR int64
+		sumCostIn, sumCo     float64
+		sumSession           int
 	)
 	for _, b := range stats.TimeBuckets {
 		sumEvent += b.EventCount
@@ -2329,6 +2389,8 @@ func TestEventsStats_BucketByDay_SumConsistency(t *testing.T) {
 		sumTool += b.ToolCallCount
 		sumTokIn += b.TokensInTotal
 		sumTout += b.TokensOutTotal
+		sumCacheW += b.CacheWriteTokensTotal
+		sumCacheR += b.CacheReadTokensTotal
 		sumCostIn += b.CostInputTotal
 		sumCo += b.CostOutputTotal
 		sumSession += b.SessionCount
@@ -2347,6 +2409,16 @@ func TestEventsStats_BucketByDay_SumConsistency(t *testing.T) {
 	}
 	if sumTout != stats.TokensOutTotal {
 		t.Errorf("sum TokensOutTotal = %d, top-level = %d", sumTout, stats.TokensOutTotal)
+	}
+	if stats.CacheWriteTokensTotal != 60 || stats.CacheReadTokensTotal != 310 {
+		t.Errorf("top-level cache tokens (write, read) = (%d, %d), want (60, 310)",
+			stats.CacheWriteTokensTotal, stats.CacheReadTokensTotal)
+	}
+	if sumCacheW != stats.CacheWriteTokensTotal {
+		t.Errorf("sum CacheWriteTokensTotal = %d, top-level = %d", sumCacheW, stats.CacheWriteTokensTotal)
+	}
+	if sumCacheR != stats.CacheReadTokensTotal {
+		t.Errorf("sum CacheReadTokensTotal = %d, top-level = %d", sumCacheR, stats.CacheReadTokensTotal)
 	}
 	if sumCostIn != stats.CostInputTotal {
 		t.Errorf("sum CostInputTotal = %g, top-level = %g", sumCostIn, stats.CostInputTotal)
