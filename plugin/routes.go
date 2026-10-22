@@ -72,12 +72,14 @@ func (h *Handler) routes() *http.ServeMux {
 // escalation path if /sessions latency exceeds the 200 ms budget; until
 // then we pay the query cost on read and keep the schema flat.
 type SessionStats struct {
-	LLMCallCount    int     `json:"llm_call_count"`
-	ToolCallCount   int     `json:"tool_call_count"`
-	TokensInTotal   int64   `json:"tokens_in_total"`
-	TokensOutTotal  int64   `json:"tokens_out_total"`
-	CostInputTotal  float64 `json:"cost_input_total"`
-	CostOutputTotal float64 `json:"cost_output_total"`
+	LLMCallCount          int     `json:"llm_call_count"`
+	ToolCallCount         int     `json:"tool_call_count"`
+	TokensInTotal         int64   `json:"tokens_in_total"`
+	TokensOutTotal        int64   `json:"tokens_out_total"`
+	CacheWriteTokensTotal int64   `json:"cache_write_tokens_total"`
+	CacheReadTokensTotal  int64   `json:"cache_read_tokens_total"`
+	CostInputTotal        float64 `json:"cost_input_total"`
+	CostOutputTotal       float64 `json:"cost_output_total"`
 }
 
 // SessionListItem is one row of GET /sessions. Title is the short LLM-
@@ -118,13 +120,15 @@ type SessionListResponse struct {
 
 // SessionTotals aggregates over the entire filtered session set.
 type SessionTotals struct {
-	SessionCount    int     `json:"session_count"`
-	LLMCallCount    int64   `json:"llm_call_count"`
-	ToolCallCount   int64   `json:"tool_call_count"`
-	TokensInTotal   int64   `json:"tokens_in_total"`
-	TokensOutTotal  int64   `json:"tokens_out_total"`
-	CostInputTotal  float64 `json:"cost_input_total"`
-	CostOutputTotal float64 `json:"cost_output_total"`
+	SessionCount          int     `json:"session_count"`
+	LLMCallCount          int64   `json:"llm_call_count"`
+	ToolCallCount         int64   `json:"tool_call_count"`
+	TokensInTotal         int64   `json:"tokens_in_total"`
+	TokensOutTotal        int64   `json:"tokens_out_total"`
+	CacheWriteTokensTotal int64   `json:"cache_write_tokens_total"`
+	CacheReadTokensTotal  int64   `json:"cache_read_tokens_total"`
+	CostInputTotal        float64 `json:"cost_input_total"`
+	CostOutputTotal       float64 `json:"cost_output_total"`
 }
 
 // SessionDetail is GET /sessions/{id} — the per-session view. Carries
@@ -291,16 +295,18 @@ type DebugEventsResponse struct {
 // by_event_type from the response when group_by was requested over an
 // empty window (the consumer knows from their own request).
 type EventStats struct {
-	SessionCount    int               `json:"session_count"`
-	EventCount      int64             `json:"event_count"`
-	LLMCallCount    int64             `json:"llm_call_count"`
-	ToolCallCount   int64             `json:"tool_call_count"`
-	TokensInTotal   int64             `json:"tokens_in_total"`
-	TokensOutTotal  int64             `json:"tokens_out_total"`
-	CostInputTotal  float64           `json:"cost_input_total"`
-	CostOutputTotal float64           `json:"cost_output_total"`
-	ByEventType     []EventTypeBucket `json:"by_event_type,omitempty"`
-	TimeBuckets     []TimeBucket      `json:"time_buckets,omitempty"`
+	SessionCount          int               `json:"session_count"`
+	EventCount            int64             `json:"event_count"`
+	LLMCallCount          int64             `json:"llm_call_count"`
+	ToolCallCount         int64             `json:"tool_call_count"`
+	TokensInTotal         int64             `json:"tokens_in_total"`
+	TokensOutTotal        int64             `json:"tokens_out_total"`
+	CacheWriteTokensTotal int64             `json:"cache_write_tokens_total"`
+	CacheReadTokensTotal  int64             `json:"cache_read_tokens_total"`
+	CostInputTotal        float64           `json:"cost_input_total"`
+	CostOutputTotal       float64           `json:"cost_output_total"`
+	ByEventType           []EventTypeBucket `json:"by_event_type,omitempty"`
+	TimeBuckets           []TimeBucket      `json:"time_buckets,omitempty"`
 }
 
 // TimeBucket is one row of the time_buckets[] breakdown, populated only
@@ -312,22 +318,25 @@ type EventStats struct {
 // without a "fill missing periods" loop.
 //
 // Sum-consistency: Σ(time_buckets[].cost_*) == top-level cost_*; same
-// for event_count and the call/token counters. SessionCount is the only
-// exception — a session that has events on multiple bucket days is
-// counted once per bucket it touches, but only once at top level
-// (distinct sessions). Σ(time_buckets[].session_count) ≥ top-level
-// session_count therefore, by design — long-running sessions
-// contribute to each bucket they're active in.
+// for event_count, the call/token counters and the cache token
+// counters. SessionCount is the only exception — a session that has
+// events on multiple bucket days is counted once per bucket it touches,
+// but only once at top level (distinct sessions).
+// Σ(time_buckets[].session_count) ≥ top-level session_count therefore,
+// by design — long-running sessions contribute to each bucket they're
+// active in.
 type TimeBucket struct {
-	Bucket          string  `json:"bucket"`
-	SessionCount    int     `json:"session_count"`
-	EventCount      int64   `json:"event_count"`
-	LLMCallCount    int64   `json:"llm_call_count"`
-	ToolCallCount   int64   `json:"tool_call_count"`
-	TokensInTotal   int64   `json:"tokens_in_total"`
-	TokensOutTotal  int64   `json:"tokens_out_total"`
-	CostInputTotal  float64 `json:"cost_input_total"`
-	CostOutputTotal float64 `json:"cost_output_total"`
+	Bucket                string  `json:"bucket"`
+	SessionCount          int     `json:"session_count"`
+	EventCount            int64   `json:"event_count"`
+	LLMCallCount          int64   `json:"llm_call_count"`
+	ToolCallCount         int64   `json:"tool_call_count"`
+	TokensInTotal         int64   `json:"tokens_in_total"`
+	TokensOutTotal        int64   `json:"tokens_out_total"`
+	CacheWriteTokensTotal int64   `json:"cache_write_tokens_total"`
+	CacheReadTokensTotal  int64   `json:"cache_read_tokens_total"`
+	CostInputTotal        float64 `json:"cost_input_total"`
+	CostOutputTotal       float64 `json:"cost_output_total"`
 }
 
 // EventTypeBucket is one row of the by_event_type breakdown. SampleSessionIDs
@@ -487,10 +496,12 @@ const (
 // events.LLMResponsePayload in opentalon. Centralised so a typo can't
 // drift between the four queries that extract from llm_response payloads.
 const (
-	payloadFieldTokensIn   = "tokens_in"
-	payloadFieldTokensOut  = "tokens_out"
-	payloadFieldCostInput  = "cost_input"
-	payloadFieldCostOutput = "cost_output"
+	payloadFieldTokensIn         = "tokens_in"
+	payloadFieldTokensOut        = "tokens_out"
+	payloadFieldCacheWriteTokens = "cache_write_tokens"
+	payloadFieldCacheReadTokens  = "cache_read_tokens"
+	payloadFieldCostInput        = "cost_input"
+	payloadFieldCostOutput       = "cost_output"
 )
 
 // limitFromQuery reads ?limit= with defaults + cap.
@@ -1420,6 +1431,8 @@ func sessionStatsSelect(d Dialect) string {
 		fmt.Sprintf("COALESCE(%s, 0) AS tool_call_count", countEventTypeExpr(eventTypeToolCallResult)),
 		"COALESCE(" + llmAggExpr(d, payloadFieldTokensIn, true) + ", 0) AS tokens_in_total",
 		"COALESCE(" + llmAggExpr(d, payloadFieldTokensOut, true) + ", 0) AS tokens_out_total",
+		"COALESCE(" + llmAggExpr(d, payloadFieldCacheWriteTokens, true) + ", 0) AS cache_write_tokens_total",
+		"COALESCE(" + llmAggExpr(d, payloadFieldCacheReadTokens, true) + ", 0) AS cache_read_tokens_total",
 		"COALESCE(" + llmAggExpr(d, payloadFieldCostInput, false) + ", 0) AS cost_input_total",
 		"COALESCE(" + llmAggExpr(d, payloadFieldCostOutput, false) + ", 0) AS cost_output_total",
 	}, ", ")
@@ -1582,6 +1595,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 			&s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource,
 			&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 			&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
+			&s.Stats.CacheWriteTokensTotal, &s.Stats.CacheReadTokensTotal,
 			&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal); err != nil {
 			return nil, sessionCursor{}, fmt.Errorf("listSessions scan: %w", err)
 		}
@@ -1611,6 +1625,8 @@ func sessionTotals(db *sql.DB, d Dialect, f sessionFilters) (SessionTotals, erro
 		COALESCE(` + countEventTypeExpr(eventTypeToolCallResult) + `, 0) AS tool_call_count,
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensIn, true) + `, 0) AS tokens_in_total,
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensOut, true) + `, 0) AS tokens_out_total,
+		COALESCE(` + llmAggExpr(d, payloadFieldCacheWriteTokens, true) + `, 0) AS cache_write_tokens_total,
+		COALESCE(` + llmAggExpr(d, payloadFieldCacheReadTokens, true) + `, 0) AS cache_read_tokens_total,
 		COALESCE(` + llmAggExpr(d, payloadFieldCostInput, false) + `, 0) AS cost_input_total,
 		COALESCE(` + llmAggExpr(d, payloadFieldCostOutput, false) + `, 0) AS cost_output_total
 		FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
@@ -1622,6 +1638,7 @@ func sessionTotals(db *sql.DB, d Dialect, f sessionFilters) (SessionTotals, erro
 	row := db.QueryRow(d.Rebind(q.String()), args...)
 	if err := row.Scan(&t.SessionCount, &t.LLMCallCount, &t.ToolCallCount,
 		&t.TokensInTotal, &t.TokensOutTotal,
+		&t.CacheWriteTokensTotal, &t.CacheReadTokensTotal,
 		&t.CostInputTotal, &t.CostOutputTotal); err != nil {
 		return SessionTotals{}, fmt.Errorf("sessionTotals: %w", err)
 	}
@@ -1647,6 +1664,7 @@ func getSession(db *sql.DB, d Dialect, id string, includeHidden bool) (*SessionD
 		&metadataJSON, &s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource,
 		&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 		&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
+		&s.Stats.CacheWriteTokensTotal, &s.Stats.CacheReadTokensTotal,
 		&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal)
 	if err != nil {
 		// Wrap with %w so the handler's errors.Is(sql.ErrNoRows) check
@@ -2390,6 +2408,8 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters, eventType string
 		COALESCE(` + countEventTypeExpr(eventTypeToolCallResult) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensIn, true) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldTokensOut, true) + `, 0),
+		COALESCE(` + llmAggExpr(d, payloadFieldCacheWriteTokens, true) + `, 0),
+		COALESCE(` + llmAggExpr(d, payloadFieldCacheReadTokens, true) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldCostInput, false) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldCostOutput, false) + `, 0)
 		FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
@@ -2403,6 +2423,7 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters, eventType string
 	if err := row.Scan(&stats.SessionCount, &stats.EventCount,
 		&stats.LLMCallCount, &stats.ToolCallCount,
 		&stats.TokensInTotal, &stats.TokensOutTotal,
+		&stats.CacheWriteTokensTotal, &stats.CacheReadTokensTotal,
 		&stats.CostInputTotal, &stats.CostOutputTotal); err != nil {
 		return EventStats{}, fmt.Errorf("eventsStatsTotals: %w", err)
 	}
@@ -2431,6 +2452,8 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 		COALESCE(%s, 0),
 		COALESCE(%s, 0),
 		COALESCE(%s, 0),
+		COALESCE(%s, 0),
+		COALESCE(%s, 0),
 		COALESCE(%s, 0)
 		FROM sessions s JOIN session_events se ON se.session_id = s.id WHERE 1=1`,
 		bucketExpr,
@@ -2438,6 +2461,8 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 		countEventTypeExpr(eventTypeToolCallResult),
 		llmAggExpr(d, payloadFieldTokensIn, true),
 		llmAggExpr(d, payloadFieldTokensOut, true),
+		llmAggExpr(d, payloadFieldCacheWriteTokens, true),
+		llmAggExpr(d, payloadFieldCacheReadTokens, true),
 		llmAggExpr(d, payloadFieldCostInput, false),
 		llmAggExpr(d, payloadFieldCostOutput, false),
 	)
@@ -2463,6 +2488,7 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 		if err := rows.Scan(&b.Bucket, &b.SessionCount, &b.EventCount,
 			&b.LLMCallCount, &b.ToolCallCount,
 			&b.TokensInTotal, &b.TokensOutTotal,
+			&b.CacheWriteTokensTotal, &b.CacheReadTokensTotal,
 			&b.CostInputTotal, &b.CostOutputTotal); err != nil {
 			return nil, fmt.Errorf("eventsStatsTimeBuckets scan: %w", err)
 		}
