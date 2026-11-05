@@ -11,7 +11,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 |--------|------|-------------|
 | GET | `/health` | Liveness + DB ping |
 | GET | `/sessions` | Paginated session list, each row with its own JIT-aggregated `stats`, plus `totals` over the full filtered set |
-| GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats`. `include_hidden=true` also returns system-injected (`visibility='hidden'`) turns — the customer transcript omits them, staff analytics pass it to debug. Accepts literal `true`/`false` only; any other value → 400 |
+| GET | `/sessions/{id}` | One session with its full message log + structured event log + aggregated `stats`. `include_hidden=true` also returns system-injected (`visibility='hidden'`) turns, each marked `"visibility": "hidden"` — the customer transcript omits them, staff analytics pass it to debug. Accepts literal `true`/`false` only; any other value → 400 |
 | PATCH | `/sessions/{id}` | Rename a session — updates the `title` column only. The one mutating endpoint; writes through a dedicated read-write pool. Body: `{"title": "..."}` (non-empty, ≤200 chars). Unknown id → 404 |
 | GET | `/sessions/{id}/events` | Incremental tail-poll for one session — events with `seq > since_seq` in ASC order, designed for a 2 s polling loop after the initial `/sessions/{id}` envelope fetch |
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
@@ -49,8 +49,14 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
   session, for attributing cost and debugging per feature instead of one
   blurred `system` bucket. NULL in the row, and therefore `""` on the wire,
   for every ordinary chat.
+- `opened_by` — exact match on the session's `opened_by` (opentalon-core
+  migration 018): the origin a server call named when it opened a chat
+  session for a user, which the user then continues. Separate from
+  `system_source`, which such a session leaves NULL. NULL in the row, and
+  therefore `""` on the wire, for every session a person or a system run
+  started.
 
-  Both are **opaque, extensible string enums**: the plugin never validates
+  All three are **opaque, extensible string enums**: the plugin never validates
   a value, so an unknown one matches no rows (empty list, `200`) rather
   than `400`. Surrounding whitespace is trimmed; case matters. An **empty
   value is a no-op**, the same as leaving the parameter out — so
@@ -60,17 +66,18 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
   which this API does not expose — a backend job that injects a turn into a
   person's chat session labels that turn, not the session.
 
-  **Requires opentalon-core with migration 016 applied.** The list and
-  detail queries select both columns unconditionally, so against an older
-  core every `/sessions` and `/sessions/{id}` call answers `500`;
-  `/events` and `/events/stats` fail only when `system_source` is set
-  (`kind` reads the older column from migration 014 and keeps working, so
-  it is not a compatibility probe). `/health` checks for both columns and
-  answers `503` with the reason when the store is behind, so a plugin build
-  that reaches an older core reports itself unready. Core applies its
-  migrations at startup before it loads plugins, so a core-then-plugin
-  rollout is safe. During a mixed rollout (pods on the old and the new
-  build side by side) an old pod ignores both filters: a paged `kind=chat`
+  **Requires opentalon-core with migration 018 applied.** The list and
+  detail queries select all three columns unconditionally, so against an
+  older core every `/sessions` and `/sessions/{id}` call answers `500`;
+  `/events` and `/events/stats` fail only when `system_source` or
+  `opened_by` is set (`kind` reads the older column from migration 014 and
+  keeps working, so it is not a compatibility probe). `/health` checks for
+  all three columns and answers `503` with the reason when the store is
+  behind, so a plugin build that reaches an older core reports itself
+  unready. Core applies its migrations at startup before it loads plugins,
+  so a core-then-plugin rollout is safe. During a mixed rollout (pods on the
+  old and the new build side by side) an old pod ignores the filters it
+  does not know: a paged `kind=chat`
   listing whose next page lands on an old pod comes back unfiltered, so
   consumers that must never show a system session should start relying on
   the filters once every pod runs this build.
@@ -155,7 +162,8 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
         "cost_output_total": 0.045
       },
       "interaction_kind": "chat",   // always present: "chat" | "system" | a future core label
-      "system_source": ""           // always present; "" on every ordinary chat, e.g. "csv_mapping" on a system session
+      "system_source": "",          // always present; "" on every ordinary chat, e.g. "csv_mapping" on a system session
+      "opened_by": ""               // always present; "" unless a server call opened the session for the user
     }
   ],
   "totals": { "session_count": 142, "llm_call_count": 631, "tokens_in_total": ..., ... },
@@ -165,7 +173,7 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
 
 `/events/stats` returns just the totals block by default.
 
-`GET /sessions/{id}` carries the same `interaction_kind` / `system_source` pair at the top level of its envelope.
+`GET /sessions/{id}` carries the same `interaction_kind` / `system_source` / `opened_by` at the top level of its envelope.
 
 #### Assistant `tool_calls` on `/sessions/{id}`
 
@@ -213,6 +221,21 @@ Each row in `messages[]` carries an optional `metadata` field — the raw JSON m
     "tool_call_id": "call_9",
     "options": "approve,reject"
   },
+  "created_at": "..."
+}
+```
+
+#### Per-message `visibility` on `/sessions/{id}`
+
+With `include_hidden=true`, a row a system injected into the session (the `messages.visibility` column, opentalon-core migration 015: fed to the model, left out of the user's transcript) carries `"visibility": "hidden"`, so a staff view can tell the injected context from the user's own messages; such a row has `role: "user"`. Every visible row omits the field, and without `include_hidden=true` no hidden row is returned at all.
+
+```jsonc
+// GET /sessions/{id}?include_hidden=true — context a server call opened the session with
+{
+  "seq": 1,
+  "role": "user",
+  "content": "[system] ...",
+  "visibility": "hidden",
   "created_at": "..."
 }
 ```
