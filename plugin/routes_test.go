@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -37,14 +38,17 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 			group_id TEXT DEFAULT '',
 			created_at TEXT,
 			updated_at TEXT,
-			-- Mirrors opentalon migrations 014 and 016, which ALTER the live
-			-- table: interaction_kind is NOT NULL DEFAULT 'chat' (every existing
-			-- row backfilled), system_source is nullable and stays NULL unless a
-			-- feature opened the session. Appended last, exactly as the ALTERs
-			-- append them, so the positional INSERTs below end with
-			-- ('chat', NULL) — an ordinary, unlabelled chat session.
+			-- Mirrors opentalon migrations 014, 016 and 018, which ALTER the
+			-- live table: interaction_kind is NOT NULL DEFAULT 'chat' (every
+			-- existing row backfilled), system_source is nullable and stays NULL
+			-- unless a feature opened the session, opened_by is nullable and
+			-- stays NULL unless a server call opened it for a user. Appended
+			-- last, exactly as the ALTERs append them, so the positional INSERTs
+			-- below end with ('chat', NULL, NULL) — an ordinary, unlabelled chat
+			-- session.
 			interaction_kind TEXT NOT NULL DEFAULT 'chat',
-			system_source TEXT
+			system_source TEXT,
+			opened_by TEXT
 		)`,
 		`CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, content TEXT, tool_calls TEXT, tool_call_id TEXT, metadata TEXT, visibility TEXT, created_at TEXT)`,
 		`CREATE UNIQUE INDEX idx_messages_session_seq ON messages(session_id, seq)`,
@@ -101,8 +105,8 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 	// with priced payloads; Session B (newer) has 1 llm_response + 1
 	// tool_call_result. Time stamps are chosen so created_at DESC gives B
 	// first and the cursor test below can walk forward into A.
-	exec(`INSERT INTO sessions VALUES ('sess_a','first session','First chat title','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z','chat',NULL)`)
-	exec(`INSERT INTO sessions VALUES ('sess_b','second session',NULL,'gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_a','first session','First chat title','gpt-4o','{}','user_1','group_x','2024-01-01T10:00:00Z','2024-01-01T10:30:00Z','chat',NULL,NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_b','second session',NULL,'gpt-4o','{"locale":"de"}','user_2','group_y','2024-02-01T10:00:00Z','2024-02-01T10:30:00Z','chat',NULL,NULL)`)
 
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_a',1,'user','hi','2024-01-01T10:00:00Z')`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_a',2,'assistant','hello','2024-01-01T10:00:01Z')`)
@@ -977,6 +981,57 @@ func TestGetSession_HiddenMessagesAreReaderAware(t *testing.T) {
 	mustStatus(t, w3, http.StatusBadRequest)
 }
 
+// A staff view that asks for hidden rows must be able to tell them from the
+// user's own messages: the hidden row carries visibility "hidden" and every
+// visible row carries no visibility key at all, so the customer view stays
+// byte-identical to the pre-existing contract. Asserted on the wire bytes,
+// since a decoded empty string cannot tell an absent key from "".
+func TestGetSession_HiddenMessageCarriesVisibility(t *testing.T) {
+	h := newTestHandler(t)
+	if _, err := h.db.Exec(
+		`INSERT INTO messages (session_id, seq, role, content, visibility, created_at)
+		 VALUES ('sess_a', 3, 'user', '[system] context', 'hidden', '2024-01-01T10:00:02Z')`); err != nil {
+		t.Fatalf("insert hidden message: %v", err)
+	}
+
+	visibilityBySeq := func(query string) map[int]json.RawMessage {
+		t.Helper()
+		w := do(t, h, "/sessions/sess_a"+query)
+		mustStatus(t, w, http.StatusOK)
+		var raw struct {
+			Messages []map[string]json.RawMessage `json:"messages"`
+		}
+		mustUnmarshal(t, w.Body.Bytes(), &raw)
+		out := make(map[int]json.RawMessage, len(raw.Messages))
+		for _, m := range raw.Messages {
+			var seq int
+			mustUnmarshal(t, m["seq"], &seq)
+			out[seq] = m["visibility"]
+		}
+		return out
+	}
+
+	staff := visibilityBySeq("?include_hidden=true")
+	if got := string(staff[3]); got != `"hidden"` {
+		t.Errorf("staff view: hidden row visibility = %s, want \"hidden\"", got)
+	}
+	for _, seq := range []int{1, 2} {
+		if v, ok := staff[seq]; !ok || v != nil {
+			t.Errorf("staff view: visible row %d: visibility = %s (present %v), want the key absent", seq, v, ok)
+		}
+	}
+
+	customer := visibilityBySeq("")
+	if len(customer) != 2 {
+		t.Fatalf("customer view: got rows %v, want the two visible ones", customer)
+	}
+	for seq, v := range customer {
+		if v != nil {
+			t.Errorf("customer view: row %d carries visibility %s, want none", seq, v)
+		}
+	}
+}
+
 func TestGetSession_TitleRoundTrip(t *testing.T) {
 	// Mirrors the list test on the detail endpoint so consumers can pick
 	// either entry point.
@@ -1049,7 +1104,7 @@ func TestGetSession_ToolCallsPassthrough(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_tc','tool-call session',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_tc','tool-call session',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z','chat',NULL,NULL)`)
 
 	// user → assistant tool-call-only → tool → assistant text answer.
 	// The first assistant row has empty content (the LLM only emitted
@@ -1114,7 +1169,7 @@ func TestGetSession_MessageMetadataPassthrough(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_md','md session',NULL,'gpt-4o','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_md','md session',NULL,'gpt-4o','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z','chat',NULL,NULL)`)
 	// Plain user turn (NULL metadata) → key omitted.
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_md',1,'user','delete 3 items','2024-08-01T10:00:00Z')`)
 	// Assistant confirmation prompt carries the tool-confirmation marker.
@@ -1173,7 +1228,7 @@ func TestGetSession_ToolCallIDPassthrough(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_tc','tc session',NULL,'gpt-oss-120b','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_tc','tc session',NULL,'gpt-oss-120b','{}','user_5','group_z','2024-08-01T10:00:00Z','2024-08-01T10:30:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_tc',1,'user','history please','2024-08-01T10:00:00Z')`)
 	// Round 1: empty-content assistant dispatch + its tool result. gpt-oss
 	// writes the dispatch row with no content, which is exactly why the row
@@ -1219,7 +1274,7 @@ func TestGetSession_MalformedMessageMetadataDropped(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_bad','bad md',NULL,'gpt-4o','{}','user_6','group_z','2024-08-02T10:00:00Z','2024-08-02T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_bad','bad md',NULL,'gpt-4o','{}','user_6','group_z','2024-08-02T10:00:00Z','2024-08-02T10:30:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, metadata, created_at) VALUES ('sess_bad',1,'assistant','x','not json','2024-08-02T10:00:00Z')`)
 
 	w := do(t, h, "/sessions/sess_bad")
@@ -1250,7 +1305,7 @@ func TestGetSession_EmptyToolCallsOmitted(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc',NULL,'gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_empty_tc','empty-tc',NULL,'gpt-4o','{}','user_4','group_z','2024-03-02T10:00:00Z','2024-03-02T10:30:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',1,'user','hi','2024-03-02T10:00:00Z')`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',2,'assistant','hello','2024-03-02T10:00:01Z')`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_empty_tc',3,'assistant','again','2024-03-02T10:00:02Z')`)
@@ -1290,7 +1345,7 @@ func TestGetSession_SynthesisesErrorRowFromLLMError(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_err','failed turn',NULL,'gpt-4o','{}','user_4','group_z','2024-04-01T10:00:00Z','2024-04-01T10:00:05Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_err','failed turn',NULL,'gpt-4o','{}','user_4','group_z','2024-04-01T10:00:00Z','2024-04-01T10:00:05Z','chat',NULL,NULL)`)
 
 	// Only the user message exists — the LLM call errored before any
 	// assistant row could be written.
@@ -1361,7 +1416,7 @@ func TestGetSession_ErrorRowInterleavedByTimestamp(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session',NULL,'gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_mix','mixed session',NULL,'gpt-4o','{}','user_5','group_z','2024-05-01T10:00:00Z','2024-05-01T10:00:30Z','chat',NULL,NULL)`)
 
 	// Turn 1: user → assistant (successful).
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_mix',1,'user','hi','2024-05-01T10:00:00Z')`)
@@ -1413,7 +1468,7 @@ func TestGetSession_PrecisionMismatchOrdersErrorAfterMessage(t *testing.T) {
 		}
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_prec','precision session',NULL,'gpt-4o','{}','user_7','group_z','2024-07-01T10:00:00Z','2024-07-01T10:00:05Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_prec','precision session',NULL,'gpt-4o','{}','user_7','group_z','2024-07-01T10:00:00Z','2024-07-01T10:00:05Z','chat',NULL,NULL)`)
 
 	// Real-world shape: user message at second precision, llm_error at
 	// microsecond precision within the same wall-clock second. The
@@ -1452,7 +1507,7 @@ func TestGetSession_ErrorContentFallback(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session',NULL,'gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_fb','fallback session',NULL,'gpt-4o','{}','user_6','group_z','2024-06-01T10:00:00Z','2024-06-01T10:00:05Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO messages (session_id, seq, role, content, created_at) VALUES ('sess_fb',1,'user','q','2024-06-01T10:00:00Z')`)
 	// Payload is valid JSON but has no response_body_excerpt — must fall back.
 	exec(`INSERT INTO session_events VALUES ('evt_fb1','sess_fb',1,'2024-06-01T10:00:02Z','llm_error',NULL,0,'{"v":1,"phase":"chat.parse"}','2024-06-01T10:00:02Z')`)
@@ -1815,7 +1870,7 @@ func TestEventsStats_GroupBy_SampleSessionsRespectsLimit(t *testing.T) {
 	// three distinct sessions. Most-recent timestamp goes to sess_c so
 	// we can also confirm it lands at index 0 under N=2.
 	if _, err := h.db.Exec(
-		`INSERT INTO sessions VALUES ('sess_c','third',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z','chat',NULL)`); err != nil {
+		`INSERT INTO sessions VALUES ('sess_c','third',NULL,'gpt-4o','{}','user_3','group_z','2024-03-01T10:00:00Z','2024-03-01T10:30:00Z','chat',NULL,NULL)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.db.Exec(
@@ -1925,7 +1980,7 @@ func TestEventsStats_GroupBy_SampleSessionIDsTiebreaker(t *testing.T) {
 	const sameTS = "2024-04-01T10:00:00Z"
 	for _, sid := range []string{"sess_beta", "sess_alpha"} {
 		if _, err := h.db.Exec(
-			`INSERT INTO sessions VALUES (?,'tie',NULL,'gpt-4o','{}','user_tie','group_tie',?,?,'chat',NULL)`,
+			`INSERT INTO sessions VALUES (?,'tie',NULL,'gpt-4o','{}','user_tie','group_tie',?,?,'chat',NULL,NULL)`,
 			sid, sameTS, sameTS); err != nil {
 			t.Fatal(err)
 		}
@@ -2046,26 +2101,26 @@ func seedBucketEvents(t *testing.T, db *sql.DB) {
 			tokIn, tokOut, cacheWrite, cacheRead, costIn, costOut)
 	}
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','',NULL,'gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_alice','',NULL,'gpt-4o','{}','u_alice','acme','2026-05-10T09:00:00Z','2026-05-12T11:00:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a1','sess_bk_alice',1,'2026-05-10T10:00:00Z','llm_response',NULL,100,?,'2026-05-10T10:00:00Z')`,
 		llmCached(100, 50, 20, 60, 0.010, 0.020))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_a2','sess_bk_alice',2,'2026-05-12T10:00:00Z','llm_response',NULL,100,?,'2026-05-12T10:00:00Z')`,
 		llm(200, 100, 0.020, 0.040))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','',NULL,'gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_bob','',NULL,'gpt-4o','{}','u_bob','acme','2026-05-14T09:00:00Z','2026-05-14T12:00:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b1','sess_bk_bob',1,'2026-05-14T10:00:00Z','llm_response',NULL,200,?,'2026-05-14T10:00:00Z')`,
 		llmCached(300, 150, 40, 250, 0.030, 0.060))
 	exec(`INSERT INTO session_events VALUES ('evt_bk_b2','sess_bk_bob',2,'2026-05-14T11:00:00Z','tool_call_result','evt_bk_b1',50,'{"v":1,"result":"ok"}','2026-05-14T11:00:00Z')`)
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','',NULL,'gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_carol','',NULL,'gpt-4o','{}','u_carol','globex','2026-05-16T09:00:00Z','2026-05-16T10:30:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_c1','sess_bk_carol',1,'2026-05-16T10:00:00Z','llm_response',NULL,100,?,'2026-05-16T10:00:00Z')`,
 		llm(400, 200, 0.040, 0.080))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_dave','',NULL,'gpt-4o','{}','u_dave','acme','2026-06-03T09:00:00Z','2026-06-03T10:00:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_dave','',NULL,'gpt-4o','{}','u_dave','acme','2026-06-03T09:00:00Z','2026-06-03T10:00:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_d1','sess_bk_dave',1,'2026-06-03T10:00:00Z','llm_response',NULL,100,?,'2026-06-03T10:00:00Z')`,
 		llm(500, 250, 0.050, 0.100))
 
-	exec(`INSERT INTO sessions VALUES ('sess_bk_ed','',NULL,'gpt-4o','{}','u_ed','acme','2025-07-15T09:00:00Z','2025-07-15T10:00:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_bk_ed','',NULL,'gpt-4o','{}','u_ed','acme','2025-07-15T09:00:00Z','2025-07-15T10:00:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_bk_e1','sess_bk_ed',1,'2025-07-15T10:00:00Z','llm_response',NULL,100,?,'2025-07-15T10:00:00Z')`,
 		llm(600, 300, 0.060, 0.120))
 }
@@ -2654,12 +2709,12 @@ func seedSpanningSessions(t *testing.T, db *sql.DB) {
 	}
 
 	// Container created APRIL, event in MAY — under se.ts contract, IN window.
-	exec(`INSERT INTO sessions VALUES ('sess_span_inside','',NULL,'gpt-4o','{}','u_ts_inside','tsax','2026-04-30T23:00:00Z','2026-05-15T11:00:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_span_inside','',NULL,'gpt-4o','{}','u_ts_inside','tsax','2026-04-30T23:00:00Z','2026-05-15T11:00:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_ts_inside','sess_span_inside',1,'2026-05-15T10:00:00Z','llm_response',NULL,100,?,'2026-05-15T10:00:00Z')`,
 		llm(700, 350, 0.070, 0.140))
 
 	// Container created MAY, event in APRIL — under se.ts contract, OUT of window.
-	exec(`INSERT INTO sessions VALUES ('sess_span_outside','',NULL,'gpt-4o','{}','u_ts_outside','tsax','2026-05-05T09:00:00Z','2026-05-05T10:00:00Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_span_outside','',NULL,'gpt-4o','{}','u_ts_outside','tsax','2026-05-05T09:00:00Z','2026-05-05T10:00:00Z','chat',NULL,NULL)`)
 	exec(`INSERT INTO session_events VALUES ('evt_ts_outside','sess_span_outside',1,'2026-04-10T10:00:00Z','llm_response',NULL,100,?,'2026-04-10T10:00:00Z')`,
 		llm(800, 400, 0.080, 0.160))
 }
@@ -3212,7 +3267,7 @@ func TestSessionEvents_LimitBoundaryAndBurstSemantics(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	exec(`INSERT INTO sessions VALUES ('sess_burst','burst',NULL,'gpt-4o','{}','user_b','group_b','2024-05-19T00:00:00Z','2024-05-19T00:00:30Z','chat',NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_burst','burst',NULL,'gpt-4o','{}','user_b','group_b','2024-05-19T00:00:00Z','2024-05-19T00:00:30Z','chat',NULL,NULL)`)
 	// Seed 30 events with seq=1..30. Insert in a non-sorted order to
 	// ensure the ORDER BY clause is doing the work, not the insertion order.
 	insertOrder := []int{15, 7, 1, 22, 30, 14, 3, 18, 9, 26, 5, 12, 20, 28, 2, 17, 24, 8, 19, 4, 21, 11, 27, 6, 13, 25, 10, 16, 29, 23}
@@ -3990,7 +4045,7 @@ func TestGetSession_ToolCallsPairedByCallID(t *testing.T) {
 				}
 				return s
 			}
-			exec(`INSERT INTO sessions VALUES ('sess_pair','pairing',NULL,'model-x','{}','user_1','group_1','2024-09-01T10:00:00Z','2024-09-01T10:30:00Z','chat',NULL)`)
+			exec(`INSERT INTO sessions VALUES ('sess_pair','pairing',NULL,'model-x','{}','user_1','group_1','2024-09-01T10:00:00Z','2024-09-01T10:30:00Z','chat',NULL,NULL)`)
 			firstSeq := tc.firstSeq
 			if firstSeq == 0 {
 				firstSeq = 1
@@ -4535,26 +4590,157 @@ func TestGetSession_ReturnsKindAndSystemSource(t *testing.T) {
 	}
 }
 
-// A store that predates core migration 016 makes every /sessions call fail
-// with a generic 500. /health must not stay green over that: it probes the
-// two label columns and reports the store as behind, with the reason.
-func TestHealth_StoreBehindCoreMigration(t *testing.T) {
+// seedOpenedSessions adds two chat sessions a server call opened for a user,
+// each with its own origin, on top of the fixture's two ordinary chat sessions
+// (sess_a, sess_b, no origin). Two origins so the filter has to discriminate;
+// sess_open_welcome carries one event so /events can be filtered by origin.
+func seedOpenedSessions(t *testing.T, h *Handler) {
+	t.Helper()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed opened sessions: %v", err)
+		}
+	}
+	exec(`INSERT INTO sessions (id, entity_id, group_id, created_at, updated_at, interaction_kind, opened_by) VALUES
+		('sess_open_welcome','user_1','group_x','2024-03-01T10:00:00Z','2024-03-01T10:00:00Z','chat','welcome'),
+		('sess_open_defect','user_1','group_x','2024-04-01T10:00:00Z','2024-04-01T10:00:00Z','chat','defect_report')`)
+	exec(`INSERT INTO session_events VALUES ('evt_open_welcome1','sess_open_welcome',1,'2024-03-01T10:00:01Z','llm_response',NULL,10,
+		'{"v":1,"tokens_in":10,"tokens_out":5,"cost_input":0.001,"cost_output":0.002}','2024-03-01T10:00:01Z')`)
+}
+
+// Every list row and the detail envelope carry opened_by, the key present
+// even when empty, so a consumer can tell "nobody opened it for the user" from
+// a plugin build that predates the field.
+func TestSessions_ReturnOpenedBy(t *testing.T) {
 	h := newTestHandler(t)
-	if _, err := h.db.Exec(`ALTER TABLE sessions DROP COLUMN system_source`); err != nil {
-		t.Fatalf("drop column to simulate a pre-016 store: %v", err)
+	seedOpenedSessions(t, h)
+
+	w := do(t, h, "/sessions")
+	mustStatus(t, w, http.StatusOK)
+	var raw struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	mustUnmarshal(t, w.Body.Bytes(), &raw)
+	got := make(map[string]string, len(raw.Items))
+	for _, item := range raw.Items {
+		var id, openedBy string
+		mustUnmarshal(t, item["id"], &id)
+		if _, ok := item["opened_by"]; !ok {
+			t.Errorf("row %s: opened_by missing from the JSON body", id)
+			continue
+		}
+		mustUnmarshal(t, item["opened_by"], &openedBy)
+		got[id] = openedBy
+	}
+	want := map[string]string{"sess_a": "", "sess_b": "", "sess_open_welcome": "welcome", "sess_open_defect": "defect_report"}
+	if !maps.Equal(got, want) {
+		t.Errorf("opened_by per row = %v, want %v", got, want)
 	}
 
-	w := do(t, h, "/health")
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503; body = %s", w.Code, w.Body.String())
+	for id, want := range map[string]string{"sess_open_welcome": "welcome", "sess_a": ""} {
+		w := do(t, h, "/sessions/"+id)
+		mustStatus(t, w, http.StatusOK)
+		var detail map[string]json.RawMessage
+		mustUnmarshal(t, w.Body.Bytes(), &detail)
+		var openedBy string
+		if _, ok := detail["opened_by"]; !ok {
+			t.Errorf("%s: opened_by missing from the JSON body", id)
+			continue
+		}
+		mustUnmarshal(t, detail["opened_by"], &openedBy)
+		if openedBy != want {
+			t.Errorf("%s: opened_by = %q, want %q", id, openedBy, want)
+		}
 	}
-	if !strings.Contains(w.Body.String(), "migration 016") {
-		t.Errorf("body should name the missing migration, got %s", w.Body.String())
-	}
+}
 
-	// The list endpoint really is down on that store — the condition /health
-	// now reports rather than hides.
-	if w := do(t, h, "/sessions"); w.Code != http.StatusInternalServerError {
-		t.Errorf("/sessions on a pre-016 store: status = %d, want 500", w.Code)
+// opened_by narrows the list on its own and ANDs with kind, under the same
+// opaque-value contract as kind and system_source: unknown narrows to nothing,
+// empty is no filter, whitespace is trimmed. Totals describe the filtered set.
+func TestListSessions_FilterByOpenedBy(t *testing.T) {
+	h := newTestHandler(t)
+	seedOpenedSessions(t, h)
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"one origin", "?opened_by=welcome", []string{"sess_open_welcome"}},
+		{"ANDs with kind", "?kind=chat&opened_by=defect_report", []string{"sess_open_defect"}},
+		{"wrong kind matches nothing", "?kind=system&opened_by=welcome", nil},
+		{"unknown origin matches nothing", "?opened_by=no_such_origin", nil},
+		{"whitespace is trimmed", "?opened_by=%20welcome%20", []string{"sess_open_welcome"}},
+		{"empty value is no filter", "?opened_by=", []string{"sess_open_defect", "sess_open_welcome", "sess_b", "sess_a"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(t, h, "/sessions"+tc.query)
+			mustStatus(t, w, http.StatusOK)
+			var resp SessionListResponse
+			mustUnmarshal(t, w.Body.Bytes(), &resp)
+			if ids := itemIDs(resp.Items); !slices.Equal(ids, tc.want) {
+				t.Fatalf("ids = %v, want %v", ids, tc.want)
+			}
+			if resp.Totals.SessionCount != len(tc.want) {
+				t.Errorf("totals.session_count = %d, want %d", resp.Totals.SessionCount, len(tc.want))
+			}
+		})
+	}
+}
+
+// /events?opened_by=… depends on the needJoin gate alone, as system_source
+// does: a gate that lost it would answer every event of every session.
+func TestEvents_FilterByOpenedByForcesSessionsJoin(t *testing.T) {
+	h := newTestHandler(t)
+	seedOpenedSessions(t, h)
+
+	for _, tc := range []struct {
+		query string
+		want  []string
+	}{
+		{"?opened_by=welcome", []string{"evt_open_welcome1"}},
+		{"?opened_by=defect_report", nil}, // opened session, no events
+		{"?opened_by=no_such_origin", nil},
+	} {
+		w := do(t, h, "/events"+tc.query)
+		mustStatus(t, w, http.StatusOK)
+		var resp EventListResponse
+		mustUnmarshal(t, w.Body.Bytes(), &resp)
+		ids := make([]string, 0, len(resp.Items))
+		for _, e := range resp.Items {
+			ids = append(ids, e.ID)
+		}
+		if !slices.Equal(ids, tc.want) {
+			t.Errorf("/events%s: ids = %v, want %v", tc.query, ids, tc.want)
+		}
+	}
+}
+
+// A store that predates core migration 018 makes every /sessions call fail
+// with a generic 500. /health must not stay green over that: it probes the
+// label columns and reports the store as behind, with the reason.
+func TestHealth_StoreBehindCoreMigration(t *testing.T) {
+	for _, column := range []string{"system_source", "opened_by"} {
+		t.Run(column, func(t *testing.T) {
+			h := newTestHandler(t)
+			if _, err := h.db.Exec(`ALTER TABLE sessions DROP COLUMN ` + column); err != nil {
+				t.Fatalf("drop %s to simulate an older store: %v", column, err)
+			}
+
+			w := do(t, h, "/health")
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body = %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "migration 018") {
+				t.Errorf("body should name the required migration, got %s", w.Body.String())
+			}
+
+			// The list endpoint really is down on that store — the condition
+			// /health reports rather than hides.
+			if w := do(t, h, "/sessions"); w.Code != http.StatusInternalServerError {
+				t.Errorf("/sessions without %s: status = %d, want 500", column, w.Code)
+			}
+		})
 	}
 }

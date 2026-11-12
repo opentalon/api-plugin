@@ -106,6 +106,11 @@ type SessionListItem struct {
 	// passes through unvalidated. Requires core migration 016 (see README).
 	InteractionKind string `json:"interaction_kind"`
 	SystemSource    string `json:"system_source"`
+	// OpenedBy is the origin a server call named when it opened the session
+	// for a user (core migration 018): an opaque label, separate from
+	// SystemSource, and "" for every session a person or a system run started
+	// (NULL in the row). Always emitted, like the two labels above.
+	OpenedBy string `json:"opened_by"`
 }
 
 // SessionListResponse is the GET /sessions envelope. Totals are computed
@@ -145,10 +150,12 @@ type SessionDetail struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	CreatedAt   string            `json:"created_at"`
 	UpdatedAt   string            `json:"updated_at"`
-	// Same two labels as SessionListItem, so a consumer that lands on one
-	// session directly can still tell a system run from a conversation.
+	// Same labels as SessionListItem, so a consumer that lands on one
+	// session directly can still tell a system run from a conversation and
+	// see who opened it.
 	InteractionKind string       `json:"interaction_kind"`
 	SystemSource    string       `json:"system_source"`
+	OpenedBy        string       `json:"opened_by"`
 	Stats           SessionStats `json:"stats"`
 	Messages        []Message    `json:"messages"`
 	Events          []Event      `json:"events"`
@@ -203,6 +210,13 @@ type SessionDetail struct {
 // text-based (non-native) tool-calling path stores its results as ordinary
 // user rows with no id at all. omitempty keeps those byte-identical to the
 // pre-existing contract.
+//
+// Visibility is the stored messages.visibility column (opentalon-core
+// migration 015): "hidden" on a turn a system injected, which the model reads
+// and the user's transcript leaves out. Only include_hidden=true returns such
+// rows, so the field tells a staff view the injected context from the user's
+// own messages. Omitted on every visible row (NULL), which stays byte-identical
+// to the pre-existing contract.
 type Message struct {
 	Seq        int             `json:"seq"`
 	Role       string          `json:"role"`
@@ -210,6 +224,7 @@ type Message struct {
 	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Metadata   json.RawMessage `json:"metadata,omitempty"`
+	Visibility string          `json:"visibility,omitempty"`
 	CreatedAt  string          `json:"created_at"`
 
 	// callIDs are the ids in the stored messages.tool_calls column — Core's
@@ -728,25 +743,25 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "db unreachable")
 		return
 	}
-	// The list and detail queries select the two session-label columns
-	// unconditionally (opentalon-core migrations 014 / 016). A store that
-	// predates them would answer 500 on /sessions while this endpoint stayed
-	// green, so probe the columns here: a plugin build that reaches an older
-	// core reports itself unready instead of looking healthy.
+	// The list and detail queries select the session-label columns
+	// unconditionally (opentalon-core migrations 014 / 016 / 018). A store
+	// that predates them would answer 500 on /sessions while this endpoint
+	// stayed green, so probe the columns here: a plugin build that reaches an
+	// older core reports itself unready instead of looking healthy.
 	if err := h.probeSessionLabelColumns(); err != nil {
 		log.Printf("api-plugin: /health: store schema behind core: %v", err)
 		writeErr(w, http.StatusServiceUnavailable,
-			"store schema behind core: sessions.interaction_kind / system_source missing (requires opentalon-core migration 016)")
+			"store schema behind core: sessions.interaction_kind / system_source / opened_by missing (requires opentalon-core migration 018)")
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 // probeSessionLabelColumns fails when the sessions table lacks the columns
-// migrations 014 / 016 add. LIMIT 0 keeps it a pure schema check on either
-// dialect.
+// migrations 014 / 016 / 018 add. LIMIT 0 keeps it a pure schema check on
+// either dialect.
 func (h *Handler) probeSessionLabelColumns() error {
-	rows, err := h.db.Query(`SELECT interaction_kind, system_source FROM sessions LIMIT 0`)
+	rows, err := h.db.Query(`SELECT interaction_kind, system_source, opened_by FROM sessions LIMIT 0`)
 	if err != nil {
 		return err
 	}
@@ -766,6 +781,7 @@ type sessionFilters struct {
 	TitleQuery       string   // case-insensitive substring match on title; empty = no title filter
 	Kind             string   // sessions.interaction_kind exact match; empty = no kind filter
 	SystemSource     string   // sessions.system_source exact match; empty = no source filter
+	OpenedBy         string   // sessions.opened_by exact match; empty = no origin filter
 }
 
 func filtersFromQuery(r *http.Request) (sessionFilters, error) {
@@ -788,11 +804,12 @@ func filtersFromQuery(r *http.Request) (sessionFilters, error) {
 		ExcludeEntityIDs: excludeIDs,
 		Since:            since,
 		Until:            until,
-		// Opaque and unvalidated: both columns are extensible string enums in
+		// Opaque and unvalidated: the columns are extensible string labels in
 		// core, so an unknown value narrows to nothing rather than 400.
 		// Trimmed like `q`; empty means "no filter", never "match NULL".
 		Kind:         strings.TrimSpace(r.URL.Query().Get("kind")),
 		SystemSource: strings.TrimSpace(r.URL.Query().Get("system_source")),
+		OpenedBy:     strings.TrimSpace(r.URL.Query().Get("opened_by")),
 	}, nil
 }
 
@@ -1481,6 +1498,10 @@ func applySessionFilters(q *strings.Builder, args *[]any, f sessionFilters) {
 		q.WriteString(" AND s.system_source = ?")
 		*args = append(*args, f.SystemSource)
 	}
+	if f.OpenedBy != "" {
+		q.WriteString(" AND s.opened_by = ?")
+		*args = append(*args, f.OpenedBy)
+	}
 	if f.Since != "" {
 		q.WriteString(" AND se.ts >= ?")
 		*args = append(*args, f.Since)
@@ -1529,7 +1550,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 	q.WriteString(`SELECT s.id, COALESCE(s.entity_id,''), COALESCE(s.group_id,''),
 		COALESCE(s.title,''), COALESCE(s.summary,''), COALESCE(s.active_model,''),
 		s.created_at, s.updated_at,
-		COALESCE(s.interaction_kind,''), COALESCE(s.system_source,''), `)
+		COALESCE(s.interaction_kind,''), COALESCE(s.system_source,''), COALESCE(s.opened_by,''), `)
 	q.WriteString(sessionStatsSelect(d))
 	q.WriteString(` FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
 
@@ -1561,7 +1582,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 	}
 
 	q.WriteString(` GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model,
-		s.created_at, s.updated_at, s.interaction_kind, s.system_source`)
+		s.created_at, s.updated_at, s.interaction_kind, s.system_source, s.opened_by`)
 	if havingCursor {
 		q.WriteString(" HAVING ")
 		q.WriteString(keysetCmp(def.Expr, sort.Direction))
@@ -1592,7 +1613,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 	for rows.Next() {
 		var s SessionListItem
 		if err := rows.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Title, &s.Summary, &s.ActiveModel,
-			&s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource,
+			&s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource, &s.OpenedBy,
 			&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 			&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 			&s.Stats.CacheWriteTokensTotal, &s.Stats.CacheReadTokensTotal,
@@ -1652,16 +1673,16 @@ func getSession(db *sql.DB, d Dialect, id string, includeHidden bool) (*SessionD
 	q.WriteString(`SELECT s.id, COALESCE(s.entity_id,''), COALESCE(s.group_id,''),
 		COALESCE(s.title,''), COALESCE(s.summary,''), COALESCE(s.active_model,''),
 		COALESCE(s.metadata,'{}'), s.created_at, s.updated_at,
-		COALESCE(s.interaction_kind,''), COALESCE(s.system_source,''), `)
+		COALESCE(s.interaction_kind,''), COALESCE(s.system_source,''), COALESCE(s.opened_by,''), `)
 	q.WriteString(sessionStatsSelect(d))
 	q.WriteString(` FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id
 		WHERE s.id = ?
 		GROUP BY s.id, s.entity_id, s.group_id, s.title, s.summary, s.active_model, s.metadata,
-		s.created_at, s.updated_at, s.interaction_kind, s.system_source`)
+		s.created_at, s.updated_at, s.interaction_kind, s.system_source, s.opened_by`)
 
 	row := db.QueryRow(d.Rebind(q.String()), id)
 	err := row.Scan(&s.ID, &s.EntityID, &s.GroupID, &s.Title, &s.Summary, &s.ActiveModel,
-		&metadataJSON, &s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource,
+		&metadataJSON, &s.CreatedAt, &s.UpdatedAt, &s.InteractionKind, &s.SystemSource, &s.OpenedBy,
 		&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 		&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 		&s.Stats.CacheWriteTokensTotal, &s.Stats.CacheReadTokensTotal,
@@ -2045,7 +2066,9 @@ func sessionMessages(db *sql.DB, d Dialect, id string, includeHidden bool) ([]Me
 	// native-path dispatch; it is read only for its call ids (the join key of
 	// annotateAssistantToolCalls) and never served as-is. The column dates
 	// from migration 008, older than any column this reader already needs.
-	q := `SELECT seq, role, content, COALESCE(metadata,''), COALESCE(tool_call_id,''), COALESCE(tool_calls,''), created_at FROM messages WHERE session_id = ?`
+	// COALESCE(visibility,'') so a visible row (NULL) serves no field; only a
+	// hidden row, returned under includeHidden, carries one.
+	q := `SELECT seq, role, content, COALESCE(metadata,''), COALESCE(tool_call_id,''), COALESCE(tool_calls,''), COALESCE(visibility,''), created_at FROM messages WHERE session_id = ?`
 	if !includeHidden {
 		q += ` AND (visibility IS NULL OR visibility <> 'hidden')`
 	}
@@ -2060,7 +2083,7 @@ func sessionMessages(db *sql.DB, d Dialect, id string, includeHidden bool) ([]Me
 	for rows.Next() {
 		var m Message
 		var metadata, toolCalls string
-		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &metadata, &m.ToolCallID, &toolCalls, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &metadata, &m.ToolCallID, &toolCalls, &m.Visibility, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("sessionMessages scan: %w", err)
 		}
 		m.callIDs = storedCallIDs(toolCalls)
@@ -2235,11 +2258,12 @@ func listEvents(db *sql.DB, d Dialect, f eventListFilters, cur cursorPair, limit
 	// one of those lists (no entity_id / group_id / event_type) therefore
 	// loses the type-index fast path — callers in that shape should pair
 	// it with a tight since/until window.
-	// kind / system_source force the JOIN too: the no-JOIN path applies only
-	// since/until, so a filter missing here is dropped silently, not loudly.
+	// kind / system_source / opened_by force the JOIN too: the no-JOIN path
+	// applies only since/until, so a filter missing here is dropped silently,
+	// not loudly.
 	needJoin := f.Filters.EntityID != "" || f.Filters.GroupID != "" ||
 		len(f.Filters.IncludeEntityIDs) > 0 || len(f.Filters.ExcludeEntityIDs) > 0 ||
-		f.Filters.Kind != "" || f.Filters.SystemSource != ""
+		f.Filters.Kind != "" || f.Filters.SystemSource != "" || f.Filters.OpenedBy != ""
 
 	var q strings.Builder
 	q.WriteString(`SELECT se.id, se.session_id, se.seq, se.ts, se.event_type,
