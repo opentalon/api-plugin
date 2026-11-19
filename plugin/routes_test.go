@@ -88,6 +88,18 @@ func setupTestDB(t *testing.T) (*sql.DB, Dialect) {
 		// Mirrors the opentalon migration index that backs the
 		// session_id WHERE + (ts, id) ORDER BY on /sessions/{id}/debug-events.
 		`CREATE INDEX idx_ai_debug_events_session_ts ON ai_debug_events(session_id, ts)`,
+		// The profile_usage columns /budget-balance reads: one row per run
+		// (opentalon migrations 002 and 014), price from migration 020, which
+		// also adds the (group_id, interaction_kind, created_at) index.
+		`CREATE TABLE profile_usage (
+			id TEXT PRIMARY KEY,
+			entity_id TEXT NOT NULL,
+			group_id TEXT,
+			interaction_kind TEXT NOT NULL DEFAULT 'chat',
+			price DOUBLE PRECISION,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX idx_profile_usage_group_kind_created ON profile_usage(group_id, interaction_kind, created_at)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatalf("DDL: %v", err)
@@ -4742,5 +4754,275 @@ func TestHealth_StoreBehindCoreMigration(t *testing.T) {
 				t.Errorf("/sessions without %s: status = %d, want 500", column, w.Code)
 			}
 		})
+	}
+}
+
+// --- Customer price and provider cost per currency ---
+
+// seedPricedSessions adds group g_price on top of the fixture: llm_response
+// events of payload v3 (cost_currency, price) next to an older v2 event that
+// carries neither. Costs are binary fractions so every sum compares exactly.
+//
+//	sess_price_mixed     u_p1  2026-11-02  USD priced 1.5, EUR priced 0
+//	                           2026-11-03  no currency, no price
+//	sess_price_zero      u_p2  2026-11-04  EUR priced 0
+//	sess_price_unpriced  u_p2  2026-11-04  no currency, no price
+func seedPricedSessions(t *testing.T, h *Handler) {
+	t.Helper()
+	const (
+		usd      = `{"v":3,"tokens_in":10,"tokens_out":5,"cost_input":0.25,"cost_output":0.5,"cost_currency":"USD","price":1.5}`
+		eurZero  = `{"v":3,"tokens_in":10,"tokens_out":5,"cost_input":0.125,"cost_output":0.0625,"cost_currency":"EUR","price":0}`
+		unpriced = `{"v":2,"tokens_in":10,"tokens_out":5,"cost_input":0.03125,"cost_output":0.015625}`
+	)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.db.Exec(q, args...); err != nil {
+			t.Fatalf("seed priced sessions: %v", err)
+		}
+	}
+	exec(`INSERT INTO sessions VALUES ('sess_price_mixed','',NULL,'claude-sonnet-5-5','{}','u_p1','g_price','2026-11-02T09:00:00Z','2026-11-03T10:00:00Z','chat',NULL,NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_price_zero','',NULL,'gpt-oss-120b','{}','u_p2','g_price','2026-11-04T09:00:00Z','2026-11-04T10:00:00Z','chat',NULL,NULL)`)
+	exec(`INSERT INTO sessions VALUES ('sess_price_unpriced','',NULL,'gpt-oss-120b','{}','u_p2','g_price','2026-11-04T10:00:00Z','2026-11-04T11:00:00Z','chat',NULL,NULL)`)
+	for _, e := range []struct{ id, session, ts, payload string }{
+		{"evt_price_usd", "sess_price_mixed", "2026-11-02T10:00:00Z", usd},
+		{"evt_price_eur", "sess_price_mixed", "2026-11-02T11:00:00Z", eurZero},
+		{"evt_price_old", "sess_price_mixed", "2026-11-03T10:00:00Z", unpriced},
+		{"evt_price_zero", "sess_price_zero", "2026-11-04T10:00:00Z", eurZero},
+		{"evt_price_none", "sess_price_unpriced", "2026-11-04T11:00:00Z", unpriced},
+	} {
+		exec(`INSERT INTO session_events VALUES (?,?,(SELECT COALESCE(MAX(seq),0)+1 FROM session_events WHERE session_id = ?),?,'llm_response',NULL,100,?,?)`,
+			e.id, e.session, e.session, e.ts, e.payload, e.ts)
+	}
+}
+
+// priceView is what one stats object says about price and provider cost:
+// price_total as its raw JSON ("null" when no call in scope carries a price)
+// and cost_by_currency decoded.
+type priceView struct {
+	Price      string
+	ByCurrency map[string]float64
+}
+
+func (v priceView) equal(o priceView) bool {
+	return v.Price == o.Price && maps.Equal(v.ByCurrency, o.ByCurrency)
+}
+
+func priceViewOf(t *testing.T, stats json.RawMessage) priceView {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	mustUnmarshal(t, stats, &fields)
+	price, ok := fields["price_total"]
+	if !ok {
+		t.Fatalf("price_total missing from %s", stats)
+	}
+	byCurrency, ok := fields["cost_by_currency"]
+	if !ok || string(byCurrency) == "null" {
+		t.Fatalf("cost_by_currency missing or null in %s", stats)
+	}
+	v := priceView{Price: string(price)}
+	mustUnmarshal(t, byCurrency, &v.ByCurrency)
+	return v
+}
+
+var (
+	priceMixed    = priceView{"1.5", map[string]float64{"USD": 0.75, "EUR": 0.1875, "none": 0.046875}}
+	priceZero     = priceView{"0", map[string]float64{"EUR": 0.1875}}
+	priceUnpriced = priceView{"null", map[string]float64{"none": 0.046875}}
+	priceGroup    = priceView{"1.5", map[string]float64{"USD": 0.75, "EUR": 0.375, "none": 0.09375}}
+)
+
+// Every session row, the list totals and the detail carry price_total (null
+// without a priced call, 0 for calls priced at 0) and the provider cost per
+// currency, events without a currency under "none"; a time filter narrows
+// both the way it narrows the cost totals.
+func TestSessions_PriceAndCostByCurrency(t *testing.T) {
+	h := newTestHandler(t)
+	seedPricedSessions(t, h)
+
+	for _, tc := range []struct {
+		name       string
+		query      string
+		perSession map[string]priceView
+		totals     priceView
+	}{
+		{"whole period", "?group_id=g_price",
+			map[string]priceView{"sess_price_mixed": priceMixed, "sess_price_zero": priceZero, "sess_price_unpriced": priceUnpriced},
+			priceGroup},
+		{"since narrows price and currencies", "?group_id=g_price&since=2026-11-03T00:00:00Z",
+			map[string]priceView{
+				"sess_price_mixed":    {"null", map[string]float64{"none": 0.046875}},
+				"sess_price_zero":     priceZero,
+				"sess_price_unpriced": priceUnpriced,
+			},
+			priceView{"0", map[string]float64{"EUR": 0.1875, "none": 0.09375}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(t, h, "/sessions"+tc.query)
+			mustStatus(t, w, http.StatusOK)
+			var resp struct {
+				Items []struct {
+					ID    string          `json:"id"`
+					Stats json.RawMessage `json:"stats"`
+				} `json:"items"`
+				Totals json.RawMessage `json:"totals"`
+			}
+			mustUnmarshal(t, w.Body.Bytes(), &resp)
+			if len(resp.Items) != len(tc.perSession) {
+				t.Fatalf("got %d sessions, want %d", len(resp.Items), len(tc.perSession))
+			}
+			for _, item := range resp.Items {
+				if got, want := priceViewOf(t, item.Stats), tc.perSession[item.ID]; !got.equal(want) {
+					t.Errorf("%s stats: got %+v, want %+v", item.ID, got, want)
+				}
+			}
+			if got := priceViewOf(t, resp.Totals); !got.equal(tc.totals) {
+				t.Errorf("totals: got %+v, want %+v", got, tc.totals)
+			}
+		})
+	}
+
+	for id, want := range map[string]priceView{"sess_price_mixed": priceMixed, "sess_price_unpriced": priceUnpriced} {
+		w := do(t, h, "/sessions/"+id)
+		mustStatus(t, w, http.StatusOK)
+		var detail struct {
+			Stats json.RawMessage `json:"stats"`
+		}
+		mustUnmarshal(t, w.Body.Bytes(), &detail)
+		if got := priceViewOf(t, detail.Stats); !got.equal(want) {
+			t.Errorf("/sessions/%s stats: got %+v, want %+v", id, got, want)
+		}
+	}
+}
+
+// /events/stats carries both fields at its root and on every daily bucket,
+// empty days included, and an event_type filter narrows them with the cost.
+func TestEventsStats_PriceAndCostByCurrency(t *testing.T) {
+	h := newTestHandler(t)
+	seedPricedSessions(t, h)
+
+	for query, want := range map[string]priceView{
+		"?group_id=g_price":                             priceGroup,
+		"?group_id=g_price&event_type=tool_call_result": {"null", map[string]float64{}},
+	} {
+		w := do(t, h, "/events/stats"+query)
+		mustStatus(t, w, http.StatusOK)
+		if got := priceViewOf(t, w.Body.Bytes()); !got.equal(want) {
+			t.Errorf("/events/stats%s: got %+v, want %+v", query, got, want)
+		}
+	}
+
+	w := do(t, h, "/events/stats?group_id=g_price&bucket_by=day&since=2026-11-02T00:00:00Z&until=2026-11-06T00:00:00Z")
+	mustStatus(t, w, http.StatusOK)
+	if got := priceViewOf(t, w.Body.Bytes()); !got.equal(priceGroup) {
+		t.Errorf("bucketed root: got %+v, want %+v", got, priceGroup)
+	}
+	var resp struct {
+		TimeBuckets []json.RawMessage `json:"time_buckets"`
+	}
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	want := []priceView{
+		{"1.5", map[string]float64{"USD": 0.75, "EUR": 0.1875}},
+		{"null", map[string]float64{"none": 0.046875}},
+		{"0", map[string]float64{"EUR": 0.1875, "none": 0.046875}},
+		{"null", map[string]float64{}},
+	}
+	if len(resp.TimeBuckets) != len(want) {
+		t.Fatalf("got %d buckets, want %d", len(resp.TimeBuckets), len(want))
+	}
+	for i, raw := range resp.TimeBuckets {
+		if got := priceViewOf(t, raw); !got.equal(want[i]) {
+			t.Errorf("bucket %d (%s): got %+v, want %+v", i, raw, got, want[i])
+		}
+	}
+}
+
+// --- /budget-balance ---
+
+// seedUsageRows adds profile_usage rows. Every query below sends since
+// 2026-11-01T00:00:00+01:00, which is 2026-10-31T23:00:00Z in the rows' text.
+//
+//	g_budget    u_a  chat    1.0   2026-10-31T23:00:00Z  exactly at since: counts
+//	g_budget    u_a  chat    2.0   2026-10-31T22:59:59Z  one second before: does not
+//	g_budget    u_b  chat    NULL  2026-11-05T10:00:00Z  counts 0
+//	g_budget    u_b  chat    0.5   2026-11-06T10:00:00Z
+//	g_budget    u_c  chat    NULL  2026-11-06T11:00:00Z  only unpriced rows: listed at 0
+//	g_budget    u_a  system  4.0   2026-11-07T10:00:00Z  counts only when kinds names system
+//	g_other     u_a  chat    8.0   2026-11-05T10:00:00Z  another group
+//	g_unpriced  u_x  chat    NULL  2026-11-05T10:00:00Z
+func seedUsageRows(t *testing.T, h *Handler) {
+	t.Helper()
+	if _, err := h.db.Exec(`INSERT INTO profile_usage (id, entity_id, group_id, interaction_kind, price, created_at) VALUES
+		('usg_1','u_a','g_budget','chat',1.0,'2026-10-31T23:00:00Z'),
+		('usg_2','u_a','g_budget','chat',2.0,'2026-10-31T22:59:59Z'),
+		('usg_3','u_b','g_budget','chat',NULL,'2026-11-05T10:00:00Z'),
+		('usg_4','u_b','g_budget','chat',0.5,'2026-11-06T10:00:00Z'),
+		('usg_5','u_c','g_budget','chat',NULL,'2026-11-06T11:00:00Z'),
+		('usg_6','u_a','g_budget','system',4.0,'2026-11-07T10:00:00Z'),
+		('usg_7','u_a','g_other','chat',8.0,'2026-11-05T10:00:00Z'),
+		('usg_8','u_x','g_unpriced','chat',NULL,'2026-11-05T10:00:00Z')`); err != nil {
+		t.Fatalf("seed usage rows: %v", err)
+	}
+}
+
+// The balance sums the group's rows and each entity's rows of the kinds asked
+// for (chat by default) since the UTC form of since; NULL prices count 0.
+func TestBudgetBalance(t *testing.T) {
+	h := newTestHandler(t)
+	seedUsageRows(t, h)
+	const since = "&since=2026-11-01T00:00:00%2B01:00"
+
+	for _, tc := range []struct {
+		name, query, want string
+	}{
+		{"chat by default", "group_id=g_budget" + since,
+			`{"price_total":1.5,"by_entity":[{"entity_id":"u_a","price_total":1},{"entity_id":"u_b","price_total":0.5},{"entity_id":"u_c","price_total":0}]}`},
+		{"system only", "group_id=g_budget&kinds=system" + since,
+			`{"price_total":4,"by_entity":[{"entity_id":"u_a","price_total":4}]}`},
+		{"chat and system", "group_id=g_budget&kinds=chat,system" + since,
+			`{"price_total":5.5,"by_entity":[{"entity_id":"u_a","price_total":5},{"entity_id":"u_b","price_total":0.5},{"entity_id":"u_c","price_total":0}]}`},
+		{"only unpriced rows", "group_id=g_unpriced" + since,
+			`{"price_total":0,"by_entity":[{"entity_id":"u_x","price_total":0}]}`},
+		{"no rows", "group_id=g_none" + since,
+			`{"price_total":0,"by_entity":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(t, h, "/budget-balance?"+tc.query)
+			mustStatus(t, w, http.StatusOK)
+			if got := strings.TrimSpace(w.Body.String()); got != tc.want {
+				t.Errorf("body = %s\nwant   %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBudgetBalance_BadRequest(t *testing.T) {
+	h := newTestHandler(t)
+	for _, tc := range []struct{ name, query, mention string }{
+		{"no group_id", "since=2026-11-01T00:00:00%2B01:00", "group_id"},
+		{"no since", "group_id=g_budget", "since"},
+		{"since without an offset", "group_id=g_budget&since=2026-11-01T00:00:00", "since"},
+		{"since not a time", "group_id=g_budget&since=november", "since"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(t, h, "/budget-balance?"+tc.query)
+			mustStatus(t, w, http.StatusBadRequest)
+			if !strings.Contains(w.Body.String(), tc.mention) {
+				t.Errorf("body should name %s, got %s", tc.mention, w.Body.String())
+			}
+		})
+	}
+}
+
+// A store that predates core migration 020 has no price to sum: the route
+// says so instead of answering a generic 500.
+func TestBudgetBalance_StoreBehindCoreMigration(t *testing.T) {
+	h := newTestHandler(t)
+	if _, err := h.db.Exec(`ALTER TABLE profile_usage DROP COLUMN price`); err != nil {
+		t.Fatalf("drop price to simulate an older store: %v", err)
+	}
+	w := do(t, h, "/budget-balance?group_id=g_budget&since=2026-11-01T00:00:00%2B01:00")
+	mustStatus(t, w, http.StatusServiceUnavailable)
+	if !strings.Contains(w.Body.String(), "migration 020") {
+		t.Errorf("body should name the required migration, got %s", w.Body.String())
 	}
 }
