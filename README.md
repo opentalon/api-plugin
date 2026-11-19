@@ -3,7 +3,7 @@
 [![CI](https://github.com/opentalon/api-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/opentalon/api-plugin/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
 
-Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_snapshots` tables, with a single narrow write exception — `PATCH /sessions/{id}` renames a session (title only), through a dedicated read-write pool while every other endpoint stays read-only. Primary consumer is the review UI; aggregations are computed JIT in SQL on each request — no aggregator worker, no denormalised counters.
+Read-only REST API over OpenTalon's `sessions`, `session_events`, `prompt_snapshots`, and `profile_usage` tables, with a single narrow write exception — `PATCH /sessions/{id}` renames a session (title only), through a dedicated read-write pool while every other endpoint stays read-only. Primary consumer is the review UI; aggregations are computed JIT in SQL on each request — no aggregator worker, no denormalised counters.
 
 ## Endpoints
 
@@ -17,6 +17,7 @@ Read-only REST API over OpenTalon's `sessions`, `session_events`, and `prompt_sn
 | GET | `/events` | Cross-session event list with cursor pagination; optional `include_payload=false` for byte-efficient analytics |
 | GET | `/events/stats` | Cross-session aggregates (tokens, cost, counts) — same filters as `/sessions` plus optional `event_type` exact-match, optional `group_by=event_type` + `sample_sessions=N`, optional `bucket_by=day/week/month/year` for time-series |
 | GET | `/prompt-snapshots?sha=...` | Resolve a prompt body by sha256 (referenced from `turn_start` events) |
+| GET | `/budget-balance` | Customer price a money budget has used: a group's `profile_usage` rows of the given kinds since a point in time, in total and per entity — see [Budget balance](#budget-balance--budget-balance) |
 
 ### Filters
 
@@ -159,7 +160,9 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
         "cache_write_tokens_total": 812,   // sum of the llm_response cache_write_tokens; 0 for events without the field
         "cache_read_tokens_total": 3904,   // same for cache_read_tokens
         "cost_input_total": 0.0123,
-        "cost_output_total": 0.045
+        "cost_output_total": 0.045,
+        "price_total": 0.08,               // customer price; null when no call carries one
+        "cost_by_currency": { "USD": 0.0573 }  // provider cost (input + output) per currency
       },
       "interaction_kind": "chat",   // always present: "chat" | "system" | a future core label
       "system_source": "",          // always present; "" on every ordinary chat, e.g. "csv_mapping" on a system session
@@ -172,6 +175,13 @@ Purpose-built for the live-tail view on the AI-Sessions diagnostic page: after a
 ```
 
 `/events/stats` returns just the totals block by default.
+
+Every `stats` object, the list `totals`, the `/events/stats` root and each of its `time_buckets[]` carry two fields beside `cost_input_total` / `cost_output_total`, both read from the `llm_response` payloads (payload v3 of opentalon-core):
+
+- `price_total` — the summed customer price (`price`) of the calls. `null` when no call in scope carries a price (calls of a profile without tariffs, and every event before v3), `0` when the priced calls sum to 0. Unpriced calls add nothing to a sum that has priced ones.
+- `cost_by_currency` — the provider cost, input plus output, per currency of the answering provider's price list (`cost_currency`), e.g. `{"USD": 0.75, "EUR": 0.19, "none": 0.05}`. Events without a currency, among them every event before v3, count under `none`. Always an object, `{}` when there is no call in scope. Nothing converts between currencies, so there is no single sum across them.
+
+Both follow the same filters as the other counters. No core migration is needed for them: on events without the fields they read `null` and `none`.
 
 `GET /sessions/{id}` carries the same `interaction_kind` / `system_source` / `opened_by` at the top level of its envelope.
 
@@ -297,10 +307,11 @@ Exceeding the cap returns 400.
   "tokens_in_total": 300, "tokens_out_total": 150,
   "cache_write_tokens_total": 20, "cache_read_tokens_total": 60,
   "cost_input_total": 0.030, "cost_output_total": 0.060,
+  "price_total": null, "cost_by_currency": {"none": 0.090},
   "time_buckets": [
-    {"bucket":"2026-05-10","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":100,"tokens_out_total":50,"cache_write_tokens_total":20,"cache_read_tokens_total":60,"cost_input_total":0.010,"cost_output_total":0.020},
-    {"bucket":"2026-05-11","session_count":0,"event_count":0,"llm_call_count":0,"tool_call_count":0,"tokens_in_total":0,"tokens_out_total":0,"cache_write_tokens_total":0,"cache_read_tokens_total":0,"cost_input_total":0,"cost_output_total":0},
-    {"bucket":"2026-05-12","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":200,"tokens_out_total":100,"cache_write_tokens_total":0,"cache_read_tokens_total":0,"cost_input_total":0.020,"cost_output_total":0.040},
+    {"bucket":"2026-05-10","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":100,"tokens_out_total":50,"cache_write_tokens_total":20,"cache_read_tokens_total":60,"cost_input_total":0.010,"cost_output_total":0.020,"price_total":null,"cost_by_currency":{"none":0.030}},
+    {"bucket":"2026-05-11","session_count":0,"event_count":0,"llm_call_count":0,"tool_call_count":0,"tokens_in_total":0,"tokens_out_total":0,"cache_write_tokens_total":0,"cache_read_tokens_total":0,"cost_input_total":0,"cost_output_total":0,"price_total":null,"cost_by_currency":{}},
+    {"bucket":"2026-05-12","session_count":1,"event_count":1,"llm_call_count":1,"tool_call_count":0,"tokens_in_total":200,"tokens_out_total":100,"cache_write_tokens_total":0,"cache_read_tokens_total":0,"cost_input_total":0.020,"cost_output_total":0.040,"price_total":null,"cost_by_currency":{"none":0.060}},
     {"bucket":"2026-05-13","session_count":0, …},
     …
   ]
@@ -309,17 +320,37 @@ Exceeding the cap returns 400.
 
 **Bucket-key format.** Always `YYYY-MM-DD`, anchored to the bucket start: day = that day, week = Monday of the week (ISO 8601), month = 1st of the month, year = January 1. The format is uniform across granularities so a chart-side date parser handles every response.
 
-**Empty bucket fill.** Periods inside `[since, until)` that contain zero events return a bucket with all-zero counters — the chart x-axis is continuous without a client-side fill loop. Always-present scaffold, even for fully empty windows.
+**Empty bucket fill.** Periods inside `[since, until)` that contain zero events return a bucket with all-zero counters, `price_total: null` and `cost_by_currency: {}` — the chart x-axis is continuous without a client-side fill loop. Always-present scaffold, even for fully empty windows.
 
 **Edge buckets may be partial.** When `since` / `until` don't align with a bucket boundary (e.g. `bucket_by=month&since=2026-05-13&until=2026-06-10` produces buckets `2026-05-01` and `2026-06-01` where both contain only partial-month data), the bucket-key reflects the natural period start but counters include only events within `[since, until)`. If you need only full buckets, align your window to the granularity yourself.
 
-**Sum-consistency.** For every counter except `session_count`, Σ(`time_buckets[].counter`) == top-level counter. The exception is by design: a session active in more than one bucket period contributes 1 to each bucket's `session_count` but is counted once at top level (distinct sessions). Long-running sessions therefore make Σ(buckets) ≥ top-level for that one field — without it, the per-bucket session count would mis-represent "who was active this day".
+**Sum-consistency.** For every counter except `session_count`, Σ(`time_buckets[].counter`) == top-level counter; so for `cost_by_currency` per currency, and for `price_total` with `null` buckets adding nothing (the top level is `null` only when every bucket is). The exception is by design: a session active in more than one bucket period contributes 1 to each bucket's `session_count` but is counted once at top level (distinct sessions). Long-running sessions therefore make Σ(buckets) ≥ top-level for that one field — without it, the per-bucket session count would mis-represent "who was active this day".
 
 **Filter axis.** `since` / `until` always apply to the event timestamp (`session_events.ts`) — see the shared filters block above. This is the same axis used by `/sessions` rows, `/events` rows, `/events/stats` totals, and `/events/stats` time buckets, so Σ(buckets) matches top-level and the same window selects the same row set everywhere.
 
 **Performance hint.** Scope queries with `entity_id`, `include_entity_ids`, or `group_id` for fastest response. Unscoped windows (admin-only "all tenants, multi-year") scan the full event stream — they work but are noticeably slower; the indexing improvement that closes this gap lives in opentalon-core.
 
 **Single aggregate over an arbitrary window.** Omit `bucket_by` entirely — the top-level fields are the single aggregate for `[since, until)`. There is no `bucket_by=all`; the no-param call already serves it.
+
+### Budget balance — `/budget-balance`
+
+The amounts a money budget of opentalon-core has used, for a budget overview. Core's budget check sums the customer price of the usage rows (`profile_usage`, one per run, written when the run ends) of a group, or of one entity in it, since the rule's `since`, over the interaction kinds the rule names. This route sums the same rows with the same conditions. It reads `profile_usage`, not the `llm_response` events the totals above read: those count every call by the time it returned, the budget counts runs by the time they ended, so the two can differ for the same group and period.
+
+- `group_id` — **required**; 400 without.
+- `since` — **required**, RFC3339 with offset (`2026-11-01T00:00:00+01:00`; encode `+` as `%2B` in the URL); 400 without or when it does not parse. Converted to UTC at second precision before the comparison, as core converts it, because the rows store `created_at` as UTC text. A row at exactly `since` counts.
+- `kinds` — comma-separated interaction kinds (default `chat`). Opaque labels like the `kind` filter: an unknown one matches no rows.
+
+```jsonc
+// GET /budget-balance?group_id=42&since=2026-11-01T00:00:00%2B01:00&kinds=chat
+{
+  "price_total": 12.5,               // the group's rows; rows without a price count 0, so never null
+  "by_entity": [                     // each entity of the group with rows in scope, ordered by entity_id; [] without rows
+    { "entity_id": "7", "price_total": 3.2 }
+  ]
+}
+```
+
+**Requires opentalon-core with migration 020 applied** (`profile_usage.price`). Against an older core the route answers `503` naming the migration; every other endpoint is unaffected, and `/health` does not check the column. Ship the core with migration 020 in the same image pin as this build, or before it.
 
 ## Configuration
 
@@ -373,6 +404,10 @@ curl -s -H "Authorization: Bearer your-secret-token" \
 # All llm_response events in a session, payload-light
 curl -s -H "Authorization: Bearer your-secret-token" \
   'https://opentalon.example.com/api/events?session_id=sess_a&event_type=llm_response&include_payload=false'
+
+# Customer price a group's chat runs used since the start of the month
+curl -s -H "Authorization: Bearer your-secret-token" \
+  'https://opentalon.example.com/api/budget-balance?group_id=team-a&since=2026-11-01T00:00:00%2B01:00&kinds=chat'
 
 # Tail-poll a session's events incrementally (resume after seq=42)
 curl -s -H "Authorization: Bearer your-secret-token" \

@@ -1,9 +1,10 @@
 // Package plugin implements the api-plugin HTTP surface — a read-only
-// REST API over OpenTalon's sessions, session_events, and prompt_snapshots
-// tables. Routes are intentionally narrow: the Rails review UI is the
-// primary consumer, and the upstream contract is "five endpoints, JIT
-// SQL aggregation, no denormalised counters". See README.md for the
-// per-endpoint shape and the design memo for the rationale.
+// REST API over OpenTalon's sessions, session_events, prompt_snapshots and
+// profile_usage tables. Routes are intentionally narrow: the Rails review UI
+// is the primary consumer, and the upstream contract is "five endpoints, JIT
+// SQL aggregation, no denormalised counters", with two exceptions argued
+// where routes registers them. See README.md for the per-endpoint shape and
+// the design memo for the rationale.
 package plugin
 
 import (
@@ -24,8 +25,9 @@ import (
 //
 // Five data endpoints plus /health, one purpose each — anything not on
 // this list is the review UI's job (filter UX, CSV export, locale
-// formatting). Adding a sixth data endpoint means re-litigating the
-// "JIT SQL is the boundary" memo.
+// formatting). Two more data endpoints are exceptions argued at their
+// registration below (/sessions/{id}/debug-events, /budget-balance); adding
+// another means re-litigating the "JIT SQL is the boundary" memo.
 //
 // Envelope shapes intentionally differ across the three list/aggregate
 // endpoints:
@@ -60,6 +62,13 @@ func (h *Handler) routes() *http.ServeMux {
 	mux.HandleFunc("GET /events", h.handleListEvents)
 	mux.HandleFunc("GET /events/stats", h.handleEventsStats)
 	mux.HandleFunc("GET /prompt-snapshots", h.handlePromptSnapshot)
+	// GET /budget-balance is the 7th data endpoint and the only one that reads
+	// profile_usage. A money budget counts the customer price of the usage rows
+	// (one per run, written when the run ends) with the conditions core's
+	// budget check sums them by; the totals above read the per-call
+	// llm_response events, which count other runs and other times, so they
+	// cannot tell what a budget has used.
+	mux.HandleFunc("GET /budget-balance", h.handleBudgetBalance)
 	return mux
 }
 
@@ -80,6 +89,14 @@ type SessionStats struct {
 	CacheReadTokensTotal  int64   `json:"cache_read_tokens_total"`
 	CostInputTotal        float64 `json:"cost_input_total"`
 	CostOutputTotal       float64 `json:"cost_output_total"`
+	// PriceTotal sums the customer price of the llm_response events (payload
+	// v3); nil (JSON null) when no call in scope carries a price, 0 when the
+	// priced calls sum to 0.
+	PriceTotal *float64 `json:"price_total"`
+	// CostByCurrency is the provider cost (input plus output) per currency of
+	// the answering provider's price list, events without one under
+	// currencyNone. Never nil: {} when there is no llm_response in scope.
+	CostByCurrency map[string]float64 `json:"cost_by_currency"`
 }
 
 // SessionListItem is one row of GET /sessions. Title is the short LLM-
@@ -134,6 +151,9 @@ type SessionTotals struct {
 	CacheReadTokensTotal  int64   `json:"cache_read_tokens_total"`
 	CostInputTotal        float64 `json:"cost_input_total"`
 	CostOutputTotal       float64 `json:"cost_output_total"`
+	// PriceTotal / CostByCurrency: as on SessionStats.
+	PriceTotal     *float64           `json:"price_total"`
+	CostByCurrency map[string]float64 `json:"cost_by_currency"`
 }
 
 // SessionDetail is GET /sessions/{id} — the per-session view. Carries
@@ -322,6 +342,10 @@ type EventStats struct {
 	CostOutputTotal       float64           `json:"cost_output_total"`
 	ByEventType           []EventTypeBucket `json:"by_event_type,omitempty"`
 	TimeBuckets           []TimeBucket      `json:"time_buckets,omitempty"`
+
+	// PriceTotal / CostByCurrency: as on SessionStats.
+	PriceTotal     *float64           `json:"price_total"`
+	CostByCurrency map[string]float64 `json:"cost_by_currency"`
 }
 
 // TimeBucket is one row of the time_buckets[] breakdown, populated only
@@ -333,8 +357,11 @@ type EventStats struct {
 // without a "fill missing periods" loop.
 //
 // Sum-consistency: Σ(time_buckets[].cost_*) == top-level cost_*; same
-// for event_count, the call/token counters and the cache token
-// counters. SessionCount is the only exception — a session that has
+// for event_count, the call/token counters, the cache token counters,
+// cost_by_currency per currency and price_total (null buckets adding
+// nothing; the top level is null only when every bucket is). An empty
+// bucket carries price_total null and cost_by_currency {}.
+// SessionCount is the only exception — a session that has
 // events on multiple bucket days is counted once per bucket it touches,
 // but only once at top level (distinct sessions).
 // Σ(time_buckets[].session_count) ≥ top-level session_count therefore,
@@ -352,6 +379,25 @@ type TimeBucket struct {
 	CacheReadTokensTotal  int64   `json:"cache_read_tokens_total"`
 	CostInputTotal        float64 `json:"cost_input_total"`
 	CostOutputTotal       float64 `json:"cost_output_total"`
+	// PriceTotal / CostByCurrency: as on SessionStats.
+	PriceTotal     *float64           `json:"price_total"`
+	CostByCurrency map[string]float64 `json:"cost_by_currency"`
+}
+
+// BudgetBalance is GET /budget-balance: the summed customer price of a
+// group's profile_usage rows of the requested kinds since a point in time,
+// and the same sum for each entity of the group that has such rows (ordered
+// by entity_id). Rows without a price count 0, so both sums are numbers, never
+// null, and ByEntity is [] when the group has no rows.
+type BudgetBalance struct {
+	PriceTotal float64               `json:"price_total"`
+	ByEntity   []EntityBudgetBalance `json:"by_entity"`
+}
+
+// EntityBudgetBalance is one entity's row of BudgetBalance.ByEntity.
+type EntityBudgetBalance struct {
+	EntityID   string  `json:"entity_id"`
+	PriceTotal float64 `json:"price_total"`
 }
 
 // EventTypeBucket is one row of the by_event_type breakdown. SampleSessionIDs
@@ -517,7 +563,18 @@ const (
 	payloadFieldCacheReadTokens  = "cache_read_tokens"
 	payloadFieldCostInput        = "cost_input"
 	payloadFieldCostOutput       = "cost_output"
+	payloadFieldCostCurrency     = "cost_currency"
+	payloadFieldPrice            = "price"
 )
+
+// currencyNone is the cost_by_currency key for llm_response events whose
+// provider names no currency (and every event before payload v3).
+const currencyNone = "none"
+
+// defaultBudgetKind is the interaction kind /budget-balance sums when the
+// request names none, as core's budget check covers chat for a rule without
+// kinds.
+const defaultBudgetKind = "chat"
 
 // limitFromQuery reads ?limit= with defaults + cap.
 //
@@ -762,6 +819,17 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // either dialect.
 func (h *Handler) probeSessionLabelColumns() error {
 	rows, err := h.db.Query(`SELECT interaction_kind, system_source, opened_by FROM sessions LIMIT 0`)
+	if err != nil {
+		return err
+	}
+	return rows.Close()
+}
+
+// probeUsagePriceColumn fails when profile_usage lacks the price column
+// opentalon-core migration 020 adds. Only /budget-balance needs it, so
+// /health does not probe it.
+func (h *Handler) probeUsagePriceColumn() error {
+	rows, err := h.db.Query(`SELECT price FROM profile_usage LIMIT 0`)
 	if err != nil {
 		return err
 	}
@@ -1413,6 +1481,57 @@ func (h *Handler) handlePromptSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, snap)
 }
 
+func (h *Handler) handleBudgetBalance(w http.ResponseWriter, r *http.Request) {
+	opts, err := budgetBalanceOptsFromQuery(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.probeUsagePriceColumn(); err != nil {
+		log.Printf("api-plugin: /budget-balance: store schema behind core: %v", err)
+		writeErr(w, http.StatusServiceUnavailable,
+			"store schema behind core: profile_usage.price missing (requires opentalon-core migration 020)")
+		return
+	}
+	bal, err := budgetBalance(h.db, h.dialect, opts)
+	if err != nil {
+		writeServerErr(w, r, "/budget-balance", err)
+		return
+	}
+	writeJSON(w, bal)
+}
+
+// budgetBalanceOpts is the parsed /budget-balance query.
+type budgetBalanceOpts struct {
+	GroupID string
+	// Since is the request's since in UTC at second precision, the text form
+	// profile_usage.created_at is written in, because the rows compare as
+	// text: an offset left in place would compare by its digits, not its time.
+	Since string
+	Kinds []string // interaction kinds; opaque labels like the kind filter
+}
+
+func budgetBalanceOptsFromQuery(r *http.Request) (budgetBalanceOpts, error) {
+	q := r.URL.Query()
+	groupID := q.Get("group_id")
+	if groupID == "" {
+		return budgetBalanceOpts{}, fmt.Errorf("group_id: required")
+	}
+	raw := q.Get("since")
+	if raw == "" {
+		return budgetBalanceOpts{}, fmt.Errorf("since: required (RFC3339 with offset)")
+	}
+	since, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return budgetBalanceOpts{}, fmt.Errorf("since: invalid timestamp %q: expected RFC3339", raw)
+	}
+	kinds, _ := parseCommaList(q.Get("kinds"), 0) // no cap, so no error
+	if kinds == nil {
+		kinds = []string{defaultBudgetKind}
+	}
+	return budgetBalanceOpts{GroupID: groupID, Since: since.UTC().Format(time.RFC3339), Kinds: kinds}, nil
+}
+
 // --- Query functions ---
 
 // countEventTypeExpr returns the SUM-CASE expression for counting events
@@ -1439,6 +1558,80 @@ func llmAggExpr(d Dialect, field string, isInt bool) string {
 		eventTypeLLMResponse, extract)
 }
 
+// priceAggExpr is llmAggExpr for the llm_response price, without the 0
+// default: the SUM is NULL when no event in scope carries a price, which
+// price_total serves as null. Never wrap it in COALESCE(…, 0).
+func priceAggExpr(d Dialect) string {
+	return fmt.Sprintf("SUM(CASE WHEN se.event_type = '%s' THEN %s END)",
+		eventTypeLLMResponse, d.JSONFloatOrNull("se.payload", payloadFieldPrice))
+}
+
+// costByCurrency sums the provider cost (input plus output) of the
+// llm_response events per currency, keyed by the value of keyExpr ("" for
+// every row when keyExpr is empty). It selects the rows the matching totals
+// query selects: the same filters, event type and session ids. Currencies are
+// rows, so this is a grouped query of its own rather than another column of
+// the single-row SUM-CASE projections. keyExpr MUST be a hard-coded SQL
+// expression, never user input. sessionIDs nil means every session the
+// filters select; a non-nil list restricts to it, so an empty one selects none.
+func costByCurrency(db *sql.DB, d Dialect, keyExpr string, f sessionFilters, eventType string, sessionIDs []string) (map[string]map[string]float64, error) {
+	out := make(map[string]map[string]float64)
+	if sessionIDs != nil && len(sessionIDs) == 0 {
+		return out, nil // writeInClause would read an empty list as no restriction
+	}
+	currency := fmt.Sprintf("COALESCE(%s, '%s')", d.JSONText("se.payload", payloadFieldCostCurrency), currencyNone)
+	key, groupBy := "''", currency
+	if keyExpr != "" {
+		key, groupBy = keyExpr, keyExpr+", "+currency
+	}
+
+	var q strings.Builder
+	fmt.Fprintf(&q, `SELECT %s, %s, SUM(%s + %s)
+		FROM sessions s JOIN session_events se ON se.session_id = s.id
+		WHERE se.event_type = '%s'`,
+		key, currency,
+		d.JSONFloat("se.payload", payloadFieldCostInput), d.JSONFloat("se.payload", payloadFieldCostOutput),
+		eventTypeLLMResponse)
+	var args []any
+	applySessionFilters(&q, &args, f)
+	applyEventTypeFilter(&q, &args, eventType)
+	writeInClause(&q, &args, "s.id", sessionIDs, false)
+	fmt.Fprintf(&q, ` GROUP BY %s`, groupBy)
+
+	rows, err := db.Query(d.Rebind(q.String()), args...)
+	if err != nil {
+		return nil, fmt.Errorf("costByCurrency: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var (
+			k, cur string
+			cost   float64
+		)
+		if err := rows.Scan(&k, &cur, &cost); err != nil {
+			return nil, fmt.Errorf("costByCurrency scan: %w", err)
+		}
+		if out[k] == nil {
+			out[k] = make(map[string]float64)
+		}
+		out[k][cur] = cost
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("costByCurrency rows: %w", err)
+	}
+	return out, nil
+}
+
+// currenciesFor returns key's per-currency costs from a costByCurrency
+// result, {} (never nil) when key has no llm_response in scope.
+func currenciesFor(byKey map[string]map[string]float64, key string) map[string]float64 {
+	if c, ok := byKey[key]; ok {
+		return c
+	}
+	return map[string]float64{}
+}
+
 // sessionStatsSelect is the per-session aggregation projection shared by
 // listSessions and getSession. Returned as a fragment to splice into the
 // outer SELECT so each row reads in one query.
@@ -1452,6 +1645,7 @@ func sessionStatsSelect(d Dialect) string {
 		"COALESCE(" + llmAggExpr(d, payloadFieldCacheReadTokens, true) + ", 0) AS cache_read_tokens_total",
 		"COALESCE(" + llmAggExpr(d, payloadFieldCostInput, false) + ", 0) AS cost_input_total",
 		"COALESCE(" + llmAggExpr(d, payloadFieldCostOutput, false) + ", 0) AS cost_output_total",
+		priceAggExpr(d) + " AS price_total",
 	}, ", ")
 }
 
@@ -1617,7 +1811,7 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 			&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 			&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 			&s.Stats.CacheWriteTokensTotal, &s.Stats.CacheReadTokensTotal,
-			&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal); err != nil {
+			&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal, &s.Stats.PriceTotal); err != nil {
 			return nil, sessionCursor{}, fmt.Errorf("listSessions scan: %w", err)
 		}
 		items = append(items, s)
@@ -1631,6 +1825,20 @@ func listSessions(db *sql.DB, d Dialect, f sessionFilters, sort sessionSort, cur
 		last := items[limit-1]
 		next = sessionCursor{Sort: sort, Value: def.Extract(last), ID: last.ID}
 		items = items[:limit]
+	}
+
+	// The page's own sessions under the same filters, so each row's
+	// currencies cover the events its other stats cover.
+	ids := make([]string, len(items))
+	for i, s := range items {
+		ids[i] = s.ID
+	}
+	byID, err := costByCurrency(db, d, "s.id", f, "", ids)
+	if err != nil {
+		return nil, sessionCursor{}, fmt.Errorf("listSessions: %w", err)
+	}
+	for i := range items {
+		items[i].Stats.CostByCurrency = currenciesFor(byID, items[i].ID)
 	}
 	return items, next, nil
 }
@@ -1649,7 +1857,8 @@ func sessionTotals(db *sql.DB, d Dialect, f sessionFilters) (SessionTotals, erro
 		COALESCE(` + llmAggExpr(d, payloadFieldCacheWriteTokens, true) + `, 0) AS cache_write_tokens_total,
 		COALESCE(` + llmAggExpr(d, payloadFieldCacheReadTokens, true) + `, 0) AS cache_read_tokens_total,
 		COALESCE(` + llmAggExpr(d, payloadFieldCostInput, false) + `, 0) AS cost_input_total,
-		COALESCE(` + llmAggExpr(d, payloadFieldCostOutput, false) + `, 0) AS cost_output_total
+		COALESCE(` + llmAggExpr(d, payloadFieldCostOutput, false) + `, 0) AS cost_output_total,
+		` + priceAggExpr(d) + ` AS price_total
 		FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
 
 	var args []any
@@ -1660,9 +1869,14 @@ func sessionTotals(db *sql.DB, d Dialect, f sessionFilters) (SessionTotals, erro
 	if err := row.Scan(&t.SessionCount, &t.LLMCallCount, &t.ToolCallCount,
 		&t.TokensInTotal, &t.TokensOutTotal,
 		&t.CacheWriteTokensTotal, &t.CacheReadTokensTotal,
-		&t.CostInputTotal, &t.CostOutputTotal); err != nil {
+		&t.CostInputTotal, &t.CostOutputTotal, &t.PriceTotal); err != nil {
 		return SessionTotals{}, fmt.Errorf("sessionTotals: %w", err)
 	}
+	byCurrency, err := costByCurrency(db, d, "", f, "", nil)
+	if err != nil {
+		return SessionTotals{}, fmt.Errorf("sessionTotals: %w", err)
+	}
+	t.CostByCurrency = currenciesFor(byCurrency, "")
 	return t, nil
 }
 
@@ -1686,13 +1900,19 @@ func getSession(db *sql.DB, d Dialect, id string, includeHidden bool) (*SessionD
 		&s.Stats.LLMCallCount, &s.Stats.ToolCallCount,
 		&s.Stats.TokensInTotal, &s.Stats.TokensOutTotal,
 		&s.Stats.CacheWriteTokensTotal, &s.Stats.CacheReadTokensTotal,
-		&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal)
+		&s.Stats.CostInputTotal, &s.Stats.CostOutputTotal, &s.Stats.PriceTotal)
 	if err != nil {
 		// Wrap with %w so the handler's errors.Is(sql.ErrNoRows) check
 		// for 404 detection still works.
 		return nil, fmt.Errorf("getSession scan: %w", err)
 	}
 	_ = json.Unmarshal([]byte(metadataJSON), &s.Metadata)
+
+	byCurrency, err := costByCurrency(db, d, "", sessionFilters{}, "", []string{id})
+	if err != nil {
+		return nil, fmt.Errorf("getSession: %w", err)
+	}
+	s.Stats.CostByCurrency = currenciesFor(byCurrency, "")
 
 	msgs, err := sessionMessages(db, d, id, includeHidden)
 	if err != nil {
@@ -2435,7 +2655,8 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters, eventType string
 		COALESCE(` + llmAggExpr(d, payloadFieldCacheWriteTokens, true) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldCacheReadTokens, true) + `, 0),
 		COALESCE(` + llmAggExpr(d, payloadFieldCostInput, false) + `, 0),
-		COALESCE(` + llmAggExpr(d, payloadFieldCostOutput, false) + `, 0)
+		COALESCE(` + llmAggExpr(d, payloadFieldCostOutput, false) + `, 0),
+		` + priceAggExpr(d) + `
 		FROM sessions s LEFT JOIN session_events se ON se.session_id = s.id WHERE 1=1`)
 
 	var args []any
@@ -2448,9 +2669,14 @@ func eventsStatsTotals(db *sql.DB, d Dialect, f sessionFilters, eventType string
 		&stats.LLMCallCount, &stats.ToolCallCount,
 		&stats.TokensInTotal, &stats.TokensOutTotal,
 		&stats.CacheWriteTokensTotal, &stats.CacheReadTokensTotal,
-		&stats.CostInputTotal, &stats.CostOutputTotal); err != nil {
+		&stats.CostInputTotal, &stats.CostOutputTotal, &stats.PriceTotal); err != nil {
 		return EventStats{}, fmt.Errorf("eventsStatsTotals: %w", err)
 	}
+	byCurrency, err := costByCurrency(db, d, "", f, eventType, nil)
+	if err != nil {
+		return EventStats{}, fmt.Errorf("eventsStatsTotals: %w", err)
+	}
+	stats.CostByCurrency = currenciesFor(byCurrency, "")
 	return stats, nil
 }
 
@@ -2478,7 +2704,8 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 		COALESCE(%s, 0),
 		COALESCE(%s, 0),
 		COALESCE(%s, 0),
-		COALESCE(%s, 0)
+		COALESCE(%s, 0),
+		%s
 		FROM sessions s JOIN session_events se ON se.session_id = s.id WHERE 1=1`,
 		bucketExpr,
 		countEventTypeExpr(eventTypeLLMResponse),
@@ -2489,6 +2716,7 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 		llmAggExpr(d, payloadFieldCacheReadTokens, true),
 		llmAggExpr(d, payloadFieldCostInput, false),
 		llmAggExpr(d, payloadFieldCostOutput, false),
+		priceAggExpr(d),
 	)
 
 	var args []any
@@ -2513,13 +2741,21 @@ func eventsStatsTimeBuckets(db *sql.DB, d Dialect, f sessionFilters, granularity
 			&b.LLMCallCount, &b.ToolCallCount,
 			&b.TokensInTotal, &b.TokensOutTotal,
 			&b.CacheWriteTokensTotal, &b.CacheReadTokensTotal,
-			&b.CostInputTotal, &b.CostOutputTotal); err != nil {
+			&b.CostInputTotal, &b.CostOutputTotal, &b.PriceTotal); err != nil {
 			return nil, fmt.Errorf("eventsStatsTimeBuckets scan: %w", err)
 		}
 		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("eventsStatsTimeBuckets rows: %w", err)
+	}
+
+	byBucket, err := costByCurrency(db, d, bucketExpr, f, eventType, nil)
+	if err != nil {
+		return nil, fmt.Errorf("eventsStatsTimeBuckets: %w", err)
+	}
+	for i := range out {
+		out[i].CostByCurrency = currenciesFor(byBucket, out[i].Bucket)
 	}
 	return out, nil
 }
@@ -2553,7 +2789,7 @@ func fillEmptyBuckets(sparse []TimeBucket, since, until, granularity string) []T
 		if b, ok := have[key]; ok {
 			out = append(out, b)
 		} else {
-			out = append(out, TimeBucket{Bucket: key})
+			out = append(out, TimeBucket{Bucket: key, CostByCurrency: map[string]float64{}})
 		}
 	}
 	return out
@@ -2665,4 +2901,40 @@ func getPromptSnapshot(db *sql.DB, d Dialect, sha string) (*PromptSnapshot, erro
 		return nil, err
 	}
 	return &p, nil
+}
+
+// budgetBalance sums profile_usage.price with the conditions of core's
+// UsageStore.PriceSince, which the budget check compares against a rule's
+// max: the group's rows, created_at at or after since, interaction_kind among
+// the kinds, NULL prices counting 0. The group total is its own SUM, as the
+// check computes it, not the sum of the per-entity rows.
+func budgetBalance(db *sql.DB, d Dialect, o budgetBalanceOpts) (BudgetBalance, error) {
+	var where strings.Builder
+	where.WriteString(` FROM profile_usage WHERE group_id = ? AND created_at >= ?`)
+	args := []any{o.GroupID, o.Since}
+	writeInClause(&where, &args, "interaction_kind", o.Kinds, false)
+
+	bal := BudgetBalance{ByEntity: []EntityBudgetBalance{}}
+	if err := db.QueryRow(d.Rebind(`SELECT COALESCE(SUM(price), 0)`+where.String()), args...).
+		Scan(&bal.PriceTotal); err != nil {
+		return BudgetBalance{}, fmt.Errorf("budgetBalance: %w", err)
+	}
+
+	rows, err := db.Query(d.Rebind(`SELECT entity_id, COALESCE(SUM(price), 0)`+where.String()+
+		` GROUP BY entity_id ORDER BY entity_id`), args...)
+	if err != nil {
+		return BudgetBalance{}, fmt.Errorf("budgetBalance by entity: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var e EntityBudgetBalance
+		if err := rows.Scan(&e.EntityID, &e.PriceTotal); err != nil {
+			return BudgetBalance{}, fmt.Errorf("budgetBalance by entity scan: %w", err)
+		}
+		bal.ByEntity = append(bal.ByEntity, e)
+	}
+	if err := rows.Err(); err != nil {
+		return BudgetBalance{}, fmt.Errorf("budgetBalance by entity rows: %w", err)
+	}
+	return bal, nil
 }

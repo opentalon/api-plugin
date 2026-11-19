@@ -63,10 +63,26 @@ func (d Dialect) JSONInt(column, fieldName string) string {
 // cost_output stamped on llm_response payloads. Same fieldName-as-constant
 // contract applies.
 func (d Dialect) JSONFloat(column, fieldName string) string {
+	return "COALESCE(" + d.JSONFloatOrNull(column, fieldName) + ", 0)"
+}
+
+// JSONFloatOrNull is JSONFloat without the 0 default: NULL when the field is
+// absent, so a SUM over it stays NULL when no row carries the field. Used for
+// the llm_response price, where "no price" and "priced at 0" differ.
+func (d Dialect) JSONFloatOrNull(column, fieldName string) string {
 	if d.name == "postgres" {
-		return fmt.Sprintf(`COALESCE(NULLIF(%s::jsonb->>'%s','')::double precision, 0)`, column, fieldName)
+		return fmt.Sprintf(`NULLIF(%s::jsonb->>'%s','')::double precision`, column, fieldName)
 	}
-	return fmt.Sprintf(`COALESCE(CAST(json_extract(%s,'$.%s') AS REAL), 0)`, column, fieldName)
+	return fmt.Sprintf(`CAST(json_extract(%s,'$.%s') AS REAL)`, column, fieldName)
+}
+
+// JSONText extracts a top-level string field, NULL when it is absent or
+// empty, so the caller picks the default. Same fieldName-as-constant contract.
+func (d Dialect) JSONText(column, fieldName string) string {
+	if d.name == "postgres" {
+		return fmt.Sprintf(`NULLIF(%s::jsonb->>'%s','')`, column, fieldName)
+	}
+	return fmt.Sprintf(`NULLIF(json_extract(%s,'$.%s'),'')`, column, fieldName)
 }
 
 // DateBucket returns a dialect-specific SQL fragment that truncates an
